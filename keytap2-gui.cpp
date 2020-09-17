@@ -3,586 +3,437 @@
  *  \author Georgi Gerganov
  */
 
+#ifdef __EMSCRIPTEN__
+#include "emscripten.h"
+#else
+#define EMSCRIPTEN_KEEPALIVE
+#endif
+
+#include "build-vars.h"
+#include "constants.h"
+#include "common.h"
+#include "common-gui.h"
 #include "subbreak.h"
+#include "subbreak2.h"
+#include "audio_logger.h"
 
 #include "imgui.h"
 #include "imgui_impl_sdl.h"
 #include "imgui_impl_opengl3.h"
 
 #include <SDL.h>
-#include <GL/gl3w.h>
 
-#include <array>
-#include <chrono>
-#include <cmath>
+#include <atomic>
 #include <cstdio>
-#include <deque>
 #include <fstream>
-#include <map>
 #include <string>
-#include <tuple>
 #include <vector>
 #include <thread>
+#include <mutex>
+#include <queue>
+#include <functional>
+#include <condition_variable>
 
-#define MY_DEBUG
+static std::function<bool()> g_doInit;
+static std::function<bool()> g_doReload;
+static std::function<void(int, int)> g_setWindowSize;
+static std::function<int()> g_getOutputRecordId;
+static std::function<bool()> g_mainUpdate;
+
+void mainUpdate(void *) {
+    g_mainUpdate();
+}
+
+// JS interface
+
+extern "C" {
+    EMSCRIPTEN_KEEPALIVE
+        int do_init() {
+            return g_doInit();
+        }
+
+    EMSCRIPTEN_KEEPALIVE
+        int do_reload() {
+            return g_doReload();
+        }
+
+    EMSCRIPTEN_KEEPALIVE
+        void set_window_size(int sizeX, int sizeY) {
+            g_setWindowSize(sizeX, sizeY);
+        }
+
+    EMSCRIPTEN_KEEPALIVE
+        int get_output_id() {
+            return g_getOutputRecordId();
+        }
+}
+
+#ifdef __EMSCRIPTEN__
+    int g_windowSizeX = 1400;
+    int g_windowSizeY = 900;
+#else
+    int g_windowSizeX = 1920;
+    int g_windowSizeY = 1200;
+#endif
 
 struct stParameters;
-struct stMatch;
-struct stKeyPressData;
-struct stWaveformView;
-struct stKeyPressCollection;
 
-using TSum                  = int64_t;
-using TSum2                 = int64_t;
-using TCC                   = double;
-using TOffset               = int64_t;
-using TMatch                = stMatch;
 using TParameters           = stParameters;
-using TSimilarityMap        = std::vector<std::vector<TMatch>>;
 
-using TClusterId            = int32_t;
-using TSampleInput          = float;
-using TSample               = int32_t;
-using TWaveform             = std::vector<TSample>;
-using TWaveformView         = stWaveformView;
-using TKeyPressPosition     = int64_t;
-using TKeyPressData         = stKeyPressData;
-using TKeyPressCollection   = stKeyPressCollection;
+using TSampleInput          = TSampleF;
+using TSample               = TSampleI16;
+using TWaveform             = TWaveformI16;
+using TWaveformView         = TWaveformViewI16;
+using TKeyPressData         = TKeyPressDataI16;
+using TKeyPressCollection   = TKeyPressCollectionI16;
+using TPlaybackData         = TPlaybackDataI16;
+
+SDL_AudioDeviceID g_deviceIdOut = 0;
+TPlaybackData g_playbackData;
 
 struct stParameters {
-    int keyPressWidth_samples   = 256;
-    int sampleRate              = 24000;
-    int offsetFromPeak          = keyPressWidth_samples/2;
-    int alignWindow             = 256;
-    float thresholdClustering   = 0.5f;
+    int32_t playbackId              = 0;
+
+    int32_t keyPressWidth_samples   = 256;
+    int32_t offsetFromPeak_samples  = keyPressWidth_samples/2;
+    int32_t alignWindow_samples     = 256;
+
+    std::vector<int>    valuesClusters = { 50, };
+    std::vector<float>  valuesPNonAlphabetic = { 0.05, 0.02, 0.01, };
+    std::vector<float>  valuesWEnglishFreq = { 20.0 };
+
+    int32_t nProcessors() const {
+        return valuesClusters.size()*valuesPNonAlphabetic.size()*valuesWEnglishFreq.size();
+    }
+
+    int32_t valueForProcessorClusters(int idx) const {
+      return valuesClusters[idx/(valuesPNonAlphabetic.size()*valuesWEnglishFreq.size())];
+    }
+
+    float valueForProcessorPNonAlphabetic(int idx) const {
+        return valuesPNonAlphabetic[(idx/valuesWEnglishFreq.size())%valuesPNonAlphabetic.size()];
+    }
+
+    float valueForProcessorWEnglishFreq(int idx) const {
+        return valuesWEnglishFreq[idx%valuesWEnglishFreq.size()];
+    }
+
+    Cipher::TParameters cipher;
 };
 
-struct stMatch {
-    TCC     cc      = 0.0;
-    TOffset offset  = 0;
-};
-
-struct stWaveformView {
-    const TSample * samples     = nullptr;
-    int64_t                     n = 0;
-};
-
-struct stKeyPressData {
-    TWaveformView       waveform;
-    TKeyPressPosition   pos         = 0;
-    TCC                 ccAvg       = 0.0;
-    TClusterId          cid         = -1;
-};
-
-struct stKeyPressCollection : public std::vector<TKeyPressData> {
-    int nClusters = 0;
-};
-
-template <typename T>
-float toSeconds(T t0, T t1) {
-    return std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count()/1024.0f;
-}
-
-TWaveformView getView(const TWaveform & waveform, int64_t idx) { return { waveform.data() + idx, (int64_t) waveform.size() - idx }; }
-
-TWaveformView getView(const TWaveform & waveform, int64_t idx, int64_t len) { return { waveform.data() + idx, len }; }
-
-bool saveKeyPresses(const char * fname, const TKeyPressCollection & keyPresses) {
-    std::ofstream fout(fname, std::ios::binary);
-    int n = keyPresses.size();
-    fout.write((char *)(&n), sizeof(n));
-    for (int i = 0; i < n; ++i) {
-        fout.write((char *)(&keyPresses[i].pos), sizeof(keyPresses[i].pos));
-    }
-    fout.close();
-
-    return true;
-}
-
-bool loadKeyPresses(const char * fname, const TWaveformView & waveform, TKeyPressCollection & keyPresses) {
-    keyPresses.clear();
-
-    std::ifstream fin(fname, std::ios::binary);
-    int n = 0;
-    fin.read((char *)(&n), sizeof(n));
-    keyPresses.resize(n);
-    for (int i = 0; i < n; ++i) {
-        keyPresses[i].waveform = waveform;
-        fin.read((char *)(&keyPresses[i].pos), sizeof(keyPresses[i].pos));
-    }
-    fin.close();
-
-    return true;
-}
-
-bool readFromFile(const std::string & fname, TWaveform & res) {
-    std::ifstream fin(fname, std::ios::binary | std::ios::ate);
-    if (fin.good() == false) {
-        return false;
-    }
-
-    {
-        std::streamsize size = fin.tellg();
-        fin.seekg(0, std::ios::beg);
-
-        static_assert(std::is_same<TSampleInput, float>::value, "TSampleInput not recognised");
-        static_assert(
-            std::is_same<TSample, float>::value
-            || std::is_same<TSample, int16_t>::value
-            || std::is_same<TSample, int32_t>::value
-                      , "TSampleInput not recognised");
-
-        if (std::is_same<TSample, int16_t>::value) {
-            std::vector<TSampleInput> buf(size/sizeof(TSampleInput));
-            res.resize(size/sizeof(TSampleInput));
-            fin.read((char *)(buf.data()), size);
-            double amax = 0.0f;
-            for (auto i = 0; i < buf.size(); ++i) if (std::abs(buf[i]) > amax) amax = std::abs(buf[i]);
-            for (auto i = 0; i < buf.size(); ++i) res[i] = std::round(32000.0*(buf[i]/amax));
-            //double asum = 0.0f;
-            //for (auto i = 0; i < buf.size(); ++i) asum += std::abs(buf[i]); asum /= buf.size(); asum *= 10.0;
-            //for (auto i = 0; i < buf.size(); ++i) res[i] = std::round(2000.0*(buf[i]/asum));
-        } else if (std::is_same<TSample, int32_t>::value) {
-            std::vector<TSampleInput> buf(size/sizeof(TSampleInput));
-            res.resize(size/sizeof(TSampleInput));
-            fin.read((char *)(buf.data()), size);
-            double amax = 0.0f;
-            for (auto i = 0; i < buf.size(); ++i) if (std::abs(buf[i]) > amax) amax = std::abs(buf[i]);
-            for (auto i = 0; i < buf.size(); ++i) res[i] = std::round(32000.0*(buf[i]/amax));
-        } else if (std::is_same<TSample, float>::value) {
-            res.resize(size/sizeof(TSample));
-            fin.read((char *)(res.data()), size);
-        } else {
-        }
-    }
-
-    fin.close();
-
-    return true;
-}
-
-bool generateLowResWaveform(const TWaveformView & waveform, TWaveform & waveformLowRes, int nWindow) {
-    waveformLowRes.resize(waveform.n);
-
-    int k = nWindow;
-
-    std::deque<int64_t> que(k);
-    auto [samples, n] = waveform;
-
-    TWaveform waveformAbs(n);
-    for (int64_t i = 0; i < n; ++i) {
-        waveformAbs[i] = std::abs(samples[i]);
-    }
-
-    for (int64_t i = 0; i < n; ++i) {
-        if (i < k) {
-            while((!que.empty()) && waveformAbs[i] >= waveformAbs[que.back()]) {
-                que.pop_back();
-            }
-            que.push_back(i);
-        } else {
-            while((!que.empty()) && que.front() <= i - k) {
-                que.pop_front();
-            }
-
-            while((!que.empty()) && waveformAbs[i] >= waveformAbs[que.back()]) {
-                que.pop_back();
-            }
-
-            que.push_back(i);
-
-            int64_t itest = i - k/2;
-            waveformLowRes[itest] = waveformAbs[que.front()];
-        }
-    }
-
-    return true;
-}
-
-bool generateLowResWaveform(const TWaveform & waveform, TWaveform & waveformLowRes, int nWindow) {
-    return generateLowResWaveform(getView(waveform, 0), waveformLowRes, nWindow);
-}
-
-bool findKeyPresses(const TWaveformView & waveform, TKeyPressCollection & res, TWaveform & waveformThreshold, double thresholdBackground, int historySize) {
-    res.clear();
-    waveformThreshold.resize(waveform.n);
-
-    int rbBegin = 0;
-    double rbAverage = 0.0;
-    std::vector<double> rbSamples(8*historySize, 0.0);
-
-    int k = historySize;
-
-    std::deque<int64_t> que(k);
-    auto [samples, n] = waveform;
-
-    TWaveform waveformAbs(n);
-    for (int64_t i = 0; i < n; ++i) {
-        waveformAbs[i] = std::abs(samples[i]);
-    }
-
-    for (int64_t i = 0; i < n; ++i) {
-        {
-            int64_t ii = i - k/2;
-            if (ii >= 0) {
-                rbAverage *= rbSamples.size();
-                rbAverage -= rbSamples[rbBegin];
-                double acur = waveformAbs[i];
-                rbSamples[rbBegin] = acur;
-                rbAverage += acur;
-                rbAverage /= rbSamples.size();
-                if (++rbBegin >= rbSamples.size()) {
-                    rbBegin = 0;
-                }
-            }
-        }
-
-        if (i < k) {
-            while((!que.empty()) && waveformAbs[i] >= waveformAbs[que.back()]) {
-                que.pop_back();
-            }
-            que.push_back(i);
-        } else {
-            while((!que.empty()) && que.front() <= i - k) {
-                que.pop_front();
-            }
-
-            while((!que.empty()) && waveformAbs[i] >= waveformAbs[que.back()]) {
-                que.pop_back();
-            }
-
-            que.push_back(i);
-
-            int64_t itest = i - k/2;
-            if (itest >= 2*k && itest < n - 2*k && que.front() == itest) {
-                double acur = waveformAbs[itest];
-                if (acur > thresholdBackground*rbAverage){
-                    TKeyPressData entry;
-                    entry.waveform = waveform;
-                    entry.pos = itest;
-                    entry.ccAvg = 0.0;
-                    entry.cid = -1;
-                    res.emplace_back(std::move(entry));
-                }
-            }
-            waveformThreshold[itest] = waveformAbs[que.front()];
-        }
-    }
-
-    return true;
-}
-
-bool findKeyPresses(const TWaveform & waveform, TKeyPressCollection & res, TWaveform & waveformThreshold, double thresholdBackground = 10.0, int historySize = 4*1024) {
-    return findKeyPresses(getView(waveform, 0), res, waveformThreshold, thresholdBackground, historySize);
-}
-
-bool dumpKeyPresses(const std::string & fname, const TKeyPressCollection & data) {
-    std::ofstream fout(fname);
-    for (auto & k : data) {
-        fout << k.pos << " 1" << std::endl;
-    }
-    fout.close();
-    return true;
-}
-
-std::tuple<TSum, TSum2> calcSum(const TWaveformView & waveform) {
-    TSum sum = 0.0f;
-    TSum2 sum2 = 0.0f;
-    auto [samples, n] = waveform;
-    for (int64_t is = 0; is < n; ++is) {
-        auto a0 = samples[is];
-        sum += a0;
-        sum2 += a0*a0;
-    }
-
-    return { sum, sum2 };
-}
-
-TCC calcCC(
-    const TWaveformView & waveform0,
-    const TWaveformView & waveform1,
-    TSum sum0, TSum2 sum02) {
-    TCC cc = -1.0f;
-
-    TSum sum1 = 0.0f;
-    TSum2 sum12 = 0.0f;
-    TSum2 sum01 = 0.0f;
-
-    auto [samples0, n0] = waveform0;
-    auto [samples1, n1] = waveform1;
-
-#ifdef MY_DEBUG
-    if (n0 != n1) {
-        printf("BUG 234f8273\n");
-    }
-#endif
-    auto n = std::min(n0, n1);
-
-    for (int64_t is = 0; is < n; ++is) {
-        auto a0 = samples0[is];
-        auto a1 = samples1[is];
-
-        sum1 += a1;
-        sum12 += a1*a1;
-        sum01 += a0*a1;
-    }
-
-    {
-        double nom = sum01*n - sum0*sum1;
-        double den2a = sum02*n - sum0*sum0;
-        double den2b = sum12*n - sum1*sum1;
-        cc = (nom)/(sqrt(den2a*den2b));
-    }
-
-    return cc;
-}
-
-std::tuple<TCC, TOffset> findBestCC(
-    const TWaveformView & waveform0,
-    const TWaveformView & waveform1,
-    int64_t alignWindow) {
-    TCC bestcc = -1.0;
-    TOffset besto = -1;
-
-    auto [samples0, n0] = waveform0;
-    auto [samples1, n1] = waveform1;
-
-#ifdef MY_DEBUG
-    if (n0 + 2*alignWindow != n1) {
-        printf("BUG 924830jm92, n0 = %d, n1 = %d, a = %d\n", (int) n0, (int) n1, (int) alignWindow);
-    }
-#endif
-
-    auto [sum0, sum02] = calcSum(waveform0);
-
-    for (int o = 0; o < 2*alignWindow; ++o) {
-        auto cc = calcCC(waveform0, { samples1 + o, n0 }, sum0, sum02);
-        if (cc > bestcc) {
-            besto = o - alignWindow;
-            bestcc = cc;
-        }
-    }
-
-    return { bestcc, besto };
-}
-
-bool calculateSimilartyMap(const TParameters & params, TKeyPressCollection & keyPresses, TSimilarityMap & res) {
-    res.clear();
-    int nPresses = keyPresses.size();
-
-    int w = params.keyPressWidth_samples;
-    int alignWindow = params.alignWindow;
-
-    res.resize(nPresses);
-    for (auto & x : res) x.resize(nPresses);
-
-    for (int i = 0; i < nPresses; ++i) {
-        res[i][i].cc = 1.0f;
-        res[i][i].offset = 0;
-
-        auto & [waveform0, pos0, avgcc, _x] = keyPresses[i];
-        auto [samples0, n0] = waveform0;
-
-        for (int j = 0; j < nPresses; ++j) {
-            if (i == j) continue;
-
-            auto waveform1 = keyPresses[j].waveform;
-            auto pos1 = keyPresses[j].pos;
-
-            auto samples1 = waveform1.samples;
-            auto [bestcc, bestoffset] = findBestCC({ samples0 + pos0 + params.offsetFromPeak,               2*w },
-                                                   { samples1 + pos1 + params.offsetFromPeak - alignWindow, 2*w + 2*alignWindow }, alignWindow);
-
-            res[i][j].cc = bestcc;
-            res[i][j].offset = bestoffset;
-
-            avgcc += bestcc;
-        }
-        avgcc /= (nPresses - 1);
-    }
-
-    return true;
-}
-
-bool clusterG(const TSimilarityMap & sim, TKeyPressCollection & keyPresses, TCC threshold) {
-    struct Pair {
-        int i = -1;
-        int j = -1;
-        TCC cc = -1.0;
-
-        bool operator < (const Pair & a) const { return cc > a.cc; }
+struct stStateUI {
+    bool doUpdate = false;
+
+    struct Flags {
+        bool recalculateSimilarityMap = false;
+        bool resetOptimization = false;
+        bool changeProcessing = false;
+        bool applyClusters = false;
+        bool applyWEnglishFreq = false;
+        bool applyHints = false;
+
+        void clear() { memset(this, 0, sizeof(Flags)); }
+    } flags;
+
+    bool autoHint = false;
+    bool processing = true;
+    bool recording = false;
+    bool audioCapture = false;
+    bool calculatingSimilarityMap = false;
+
+    // key presses window
+    bool scrolling = false;
+    bool recalculateKeyPresses = false;
+
+    int nview = -1;
+    int offset = -1;
+    int viewMin = 512;
+    int viewMax = 512;
+    int nviewPrev = -1;
+    int lastSize = -1;
+    int lastKeyPresses = 0;
+
+    float amin = std::numeric_limits<TSample>::min();
+    float amax = std::numeric_limits<TSample>::max();
+
+    float dragOffset = 0.0f;
+    float scrollSize = 18.0f;
+
+    TWaveform waveformLowRes;
+    TWaveform waveformThreshold;
+    TWaveform waveformMax;
+
+    // window sizes
+    float windowHeightTitleBar = 0;
+    float windowHeightKeyPesses = 0;
+    float windowHeightResults = 0;
+    float windowHeightSimilarity = 0;
+
+    bool openAboutWindow = false;
+    bool openParametersWindow = false;
+    bool loadRecord = false;
+    bool loadKeyPresses = false;
+    bool rescaleWaveform = true;
+
+    int outputRecordId = 0;
+
+    double maxSample = 0.0;
+
+    std::string fnameRecord = "default.kbd";
+    std::string fnameKeyPressess = "default.kbd.keys";
+
+    TParameters params;
+    TWaveformF waveformOriginal;
+    TWaveform waveformInput;
+    TKeyPressCollection keyPresses;
+    TSimilarityMap similarityMap;
+
+    Cipher::THint suggestions;
+
+    struct ProcessorResults : std::vector<Cipher::TResult> {
+        int id = 0;
     };
 
-    int n = keyPresses.size();
+    std::map<int, ProcessorResults> results;
+};
 
-    int nclusters = 0;
-    for (int i = 0; i < n; ++i) {
-        keyPresses[i].cid = i + 1;
-        ++nclusters;
+struct stStateCore {
+    struct Flags {
+        bool calculatingSimilarityMap = false;
+        bool updateSimilarityMap = false;
+        bool updateResult[128];
+
+        void clear() { memset(this, 0, sizeof(Flags)); }
+    } flags;
+
+    bool processing = true;
+
+    Cipher::TFreqMap * freqMap[3];
+    TParameters params;
+    TSimilarityMap similarityMap;
+    TKeyPressCollection keyPresses;
+
+    std::map<int, Cipher::Processor> processors;
+};
+
+struct stStateCapture {
+    struct Flags {
+        bool updateRecord = false;
+
+        void clear() { memset(this, 0, sizeof(Flags)); }
+    } flags;
+
+    AudioLogger::Record recordNew;
+};
+
+template<typename T>
+struct TripleBuffer : public T {
+    bool update(bool force = false) {
+        std::lock_guard<std::mutex> lock(mutex);
+        hasChanged = true || force;
+        this->flags.clear();
+
+        return true;
     }
 
-    std::vector<Pair> ccpairs;
-    for (int i = 0; i < n - 1; ++i) {
-        for (int j = i + 1; j < n; ++j) {
-            ccpairs.emplace_back(Pair{i, j, sim[i][j].cc});
-        }
+    bool changed() {
+        std::lock_guard<std::mutex> lock(mutex);
+        return hasChanged;
     }
 
-    std::sort(ccpairs.begin(), ccpairs.end());
+    const T & get() {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (hasChanged) {
+            out = buffer;
+            hasChanged = false;
+        }
 
-    printf("[+] Top 10 pairs\n");
-    for (int i = 0; i < 10; ++i) {
-        printf("    Pair %d: %d %d %g\n", i, ccpairs[i].i, ccpairs[i].j, ccpairs[i].cc);
+        return out;
+    }
+private:
+    bool hasChanged = false;
+
+    T buffer;
+    T out;
+
+    mutable std::mutex mutex;
+};
+
+template<> bool TripleBuffer<stStateUI>::update(bool force) {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (hasChanged && force == false) return false;
+
+    hasChanged = true;
+
+    buffer.flags = this->flags;
+
+    if (this->flags.recalculateSimilarityMap || this->flags.resetOptimization) {
+        buffer.params = this->params;
+        buffer.keyPresses = this->keyPresses;
     }
 
-    int npairs = ccpairs.size();
-    for (int ip = 0; ip < npairs; ++ip) {
-        auto & curpair = ccpairs[ip];
-        //if (frand() > curpair.cc) continue;
-        if (curpair.cc < threshold) break;
-
-        auto ci = keyPresses[curpair.i].cid;
-        auto cj = keyPresses[curpair.j].cid;
-
-        if (ci == cj) continue;
-        auto cnew = std::min(ci, cj);
-        int nsum = 0;
-        int nsumi = 0;
-        int nsumj = 0;
-        double sumcc = 0.0;
-        double sumcci = 0.0;
-        double sumccj = 0.0;
-        for (int k = 0; k < n; ++k) {
-            auto & ck = keyPresses[k].cid;
-            for (int q = 0; q < n; ++q) {
-                if (q == k) continue;
-                auto & cq = keyPresses[q].cid;
-                if ((ck == ci || ck == cj) && (cq == ci || cq == cj)) {
-                    sumcc += sim[k][q].cc;
-                    ++nsum;
-                }
-                if (ck == ci && cq == ci) {
-                    sumcci += sim[k][q].cc;
-                    ++nsumi;
-                }
-                if (ck == cj && cq == cj) {
-                    sumccj += sim[k][q].cc;
-                    ++nsumj;
-                }
-            }
-        }
-        sumcc /= nsum;
-        if (nsumi > 0) sumcci /= nsumi;
-        if (nsumj > 0) sumccj /= nsumj;
-        printf("Merge avg n = %4d, cc = %8.5f, ni = %4d, cci = %8.5f, nj = %4d, ccj = %8.5f\n", nsum, sumcc, nsumi, sumcci, nsumj, sumccj);
-
-        //if (sumcc < 1.000*curpair.cc) continue;
-        //if (sumcc > 0.75*sumccj && sumcc > 0.75*sumcci) {
-        if (sumcc > 0.4*(sumcci + sumccj)) {
-        } else {
-            continue;
-        }
-
-        for (int k = 0; k < n; ++k) {
-            auto & ck = keyPresses[k].cid;
-            if (ck == ci || ck == cj) ck = cnew;
-        }
-        --nclusters;
+    if (this->flags.changeProcessing) {
+        buffer.processing = this->processing;
     }
 
-    keyPresses.nClusters = nclusters;
+    if (this->flags.applyClusters) {
+        buffer.params = this->params;
+    }
+
+    if (this->flags.applyWEnglishFreq) {
+        buffer.params = this->params;
+    }
+
+    if (this->flags.applyHints) {
+        buffer.keyPresses = this->keyPresses;
+    }
+
+    this->flags.clear();
 
     return true;
 }
 
-bool adjustKeyPresses(const TParameters & params, TKeyPressCollection & keyPresses, TSimilarityMap & sim) {
-    struct Pair {
-        int i = -1;
-        int j = -1;
-        TCC cc = -1.0;
+template<> bool TripleBuffer<stStateCore>::update(bool force) {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (hasChanged && force == false) return false;
 
-        bool operator < (const Pair & a) const { return cc > a.cc; }
-    };
+    hasChanged = true;
 
-    int n = keyPresses.size();
+    buffer.flags = this->flags;
 
-    std::vector<Pair> ccpairs;
-    for (int i = 0; i < n - 1; ++i) {
-        for (int j = i + 1; j < n; ++j) {
-            ccpairs.emplace_back(Pair{i, j, sim[i][j].cc});
+    if (this->flags.updateSimilarityMap) {
+        buffer.similarityMap = this->similarityMap;
+    }
+
+    for (int i = 0; i < this->params.nProcessors(); ++i) {
+        if (this->flags.updateResult[i]) {
+            buffer.processors[i] = this->processors[i];
         }
     }
 
-    int nused = 0;
-    std::vector<bool> used(n, false);
-
-    std::sort(ccpairs.begin(), ccpairs.end());
-
-    int npairs = ccpairs.size();
-    for (int ip = 0; ip < npairs; ++ip) {
-        auto & curpair = ccpairs[ip];
-        int k0 = curpair.i;
-        int k1 = curpair.j;
-        if (used[k0] && used[k1]) continue;
-
-        if (used[k1] == false) {
-            keyPresses[k1].pos += sim[k0][k1].offset;
-        } else {
-            keyPresses[k0].pos -= sim[k0][k1].offset;
-        }
-
-        if (used[k0] == false) { used[k0] = true; ++nused; }
-        if (used[k1] == false) { used[k1] = true; ++nused; }
-
-        if (nused == n) break;
-    }
+    this->flags.clear();
 
     return true;
 }
+
+template<> const stStateCapture & TripleBuffer<stStateCapture>::get() {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (hasChanged) {
+        out = std::move(buffer);
+        hasChanged = false;
+    }
+
+    return out;
+}
+
+template<> bool TripleBuffer<stStateCapture>::update(bool force) {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (hasChanged && force == false) return false;
+
+    hasChanged = true;
+
+    buffer.flags = this->flags;
+
+    if (this->flags.updateRecord) {
+        buffer.recordNew.insert(
+                buffer.recordNew.end(),
+                make_move_iterator(this->recordNew.begin()),
+                make_move_iterator(this->recordNew.end()));
+        this->recordNew.clear();
+    }
+
+    this->flags.clear();
+
+    return true;
+}
+
+std::atomic<bool> g_doRecord;
+AudioLogger audioLogger;
+TripleBuffer<stStateUI> stateUI;
+TripleBuffer<stStateCore> stateCore;
+TripleBuffer<stStateCapture> stateCapture;
 
 float plotWaveform(void * data, int i) {
     TWaveformView * waveform = (TWaveformView *)data;
     return waveform->samples[i];
-};
+}
 
 float plotWaveformInverse(void * data, int i) {
     TWaveformView * waveform = (TWaveformView *)data;
     return -waveform->samples[i];
-};
+}
 
-struct PlaybackData {
-    static const int kSamples = 1024;
-    int slowDown = 1;
-    int64_t idx = 0;
-    int64_t offset = 0;
-    TWaveformView waveform;
-};
+bool renderKeyPresses(stStateUI & stateUI, const TWaveform & waveform, TKeyPressCollection & keyPresses) {
+    auto & params = stateUI.params;
 
-SDL_AudioDeviceID g_deviceIdOut = 0;
-PlaybackData g_playbackData;
+    bool & scrolling = stateUI.scrolling;
+    bool & recalculateKeyPresses = stateUI.recalculateKeyPresses;
 
-bool renderKeyPresses(TParameters & params, const char * fnameInput, const TWaveform & waveform, TKeyPressCollection & keyPresses) {
-    if (ImGui::Begin("Key Presses")) {
-        int viewMin = 512;
-        int viewMax = waveform.size();
+    int & nview = stateUI.nview;
+    int & viewMin = stateUI.viewMin;
+    int & viewMax = stateUI.viewMax;
+    int & offset = stateUI.offset;
+    int & lastSize = stateUI.lastSize;
+    int & lastKeyPresses = stateUI.lastKeyPresses;
 
+    float & amin = stateUI.amin;
+    float & amax = stateUI.amax;
+
+    float & dragOffset = stateUI.dragOffset;
+    float & scrollSize = stateUI.scrollSize;
+
+    auto & nviewPrev = stateUI.nviewPrev;
+
+    TWaveform & waveformLowRes = stateUI.waveformLowRes;
+    TWaveform & waveformThreshold = stateUI.waveformThreshold;
+    TWaveform & waveformMax = stateUI.waveformMax;
+
+    if (nview < 0) nview = waveform.size();
+    if (offset < 0) offset = (waveform.size() - nview)/2;
+
+    if (stateUI.recording) {
+        if (nview < 1024*kSamplesPerFrame && scrolling == false) {
+            nview = std::min((int) (1024*kSamplesPerFrame), (int) waveform.size());
+        }
+    }
+
+    if (lastSize != (int) waveform.size()) {
+        viewMax = waveform.size();
+        lastSize = waveform.size();
+        nviewPrev = nview + 1;
+
+        if (scrolling == false) {
+            offset = waveform.size() - nview;
+        }
+    }
+
+#ifndef __EMSCRIPTEN__
+    if ((int) keyPresses.size() >= lastKeyPresses + 10) {
+        lastKeyPresses = keyPresses.size();
+
+        stateUI.similarityMap.clear();
+        stateUI.flags.recalculateSimilarityMap = true;
+        stateUI.doUpdate = true;
+    }
+#endif
+
+    ImGui::SetNextWindowPos(ImVec2(0, stateUI.windowHeightTitleBar), ImGuiCond_Once);
+    if (stateUI.windowHeightKeyPesses == 0.0f) {
+        ImGui::SetNextWindowSize(ImVec2(g_windowSizeX, 250.0f), ImGuiCond_Always);
+    } else {
+        ImGui::SetNextWindowSize(ImVec2(g_windowSizeX, stateUI.windowHeightKeyPesses), ImGuiCond_Always);
+    }
+    if (ImGui::Begin("Key Presses", nullptr, ImGuiWindowFlags_NoMove)) {
         bool ignoreDelete = false;
 
-        static int nview = waveform.size();
-        static int offset = (waveform.size() - nview)/2;
-        static float amin = -16000;
-        static float amax = 16000;
-        static float dragOffset = 0.0f;
-        static float scrollSize = 18.0f;
+        auto wsize = ImVec2(ImGui::GetContentRegionAvailWidth(), ImGui::GetContentRegionAvail().y - 3*ImGui::GetTextLineHeightWithSpacing());
 
-        static auto nviewPrev = nview + 1;
-
-        static TWaveform waveformLowRes = waveform;
-        static TWaveform waveformThreshold = waveform;
+        if (nview != nviewPrev) {
+            generateLowResWaveform(waveform, waveformLowRes, std::max(1.0f, nview/wsize.x));
+            nviewPrev = nview;
+        }
 
         auto wview = getView(waveformLowRes, offset, nview);
-        auto tview = getView(waveformThreshold, offset, nview);
-        auto wsize = ImVec2(ImGui::GetContentRegionAvailWidth(), 250.0);
 
         auto mpos = ImGui::GetIO().MousePos;
         auto savePos = ImGui::GetCursorScreenPos();
@@ -596,17 +447,34 @@ bool renderKeyPresses(TParameters & params, const char * fnameInput, const TWave
         ImGui::PushStyleColor(ImGuiCol_PlotHistogram, { 1.0f, 1.0f, 1.0f, 1.0f });
         ImGui::PlotHistogram("##Waveform", plotWaveformInverse, &wview, nview, 0, "Waveform", amin, amax, wsize);
         ImGui::PopStyleColor(2);
+
+        if (waveform.size() == waveformThreshold.size() && waveform.size() == waveformMax.size()) {
+            auto tview = getView(waveformThreshold, offset, nview);
+            auto mview = getView(waveformMax, offset, nview);
+
+            ImGui::SetCursorScreenPos(savePos);
+            ImGui::PushStyleColor(ImGuiCol_FrameBg, { 0.0f, 0.0f, 0.0f, 0.0f });
+            ImGui::PushStyleColor(ImGuiCol_PlotLines, { 1.0f, 1.0f, 0.0f, 0.5f });
+            ImGui::PlotLines("##WaveformThreshold", plotWaveform, &tview, nview, 0, "", amin, amax, wsize);
+            ImGui::PopStyleColor(2);
+            ImGui::SetCursorScreenPos(savePos);
+            ImGui::PushStyleColor(ImGuiCol_FrameBg, { 0.0f, 0.0f, 0.0f, 0.0f });
+            ImGui::PushStyleColor(ImGuiCol_PlotLines, { 1.0f, 1.0f, 0.0f, 0.5f });
+            ImGui::PlotLines("##WaveformThreshold", plotWaveformInverse, &tview, nview, 0, "", amin, amax, wsize);
+            ImGui::PopStyleColor(2);
+            ImGui::SetCursorScreenPos(savePos);
+            ImGui::PushStyleColor(ImGuiCol_FrameBg, { 0.0f, 0.0f, 0.0f, 0.0f });
+            ImGui::PushStyleColor(ImGuiCol_PlotLines, { 0.0f, 1.0f, 0.0f, 0.5f });
+            ImGui::PlotLines("##WaveformMax", plotWaveform, &mview, nview, 0, "", amin, amax, wsize);
+            ImGui::PopStyleColor(2);
+            ImGui::SetCursorScreenPos(savePos);
+            ImGui::PushStyleColor(ImGuiCol_FrameBg, { 0.0f, 0.0f, 0.0f, 0.0f });
+            ImGui::PushStyleColor(ImGuiCol_PlotLines, { 0.0f, 1.0f, 0.0f, 0.5f });
+            ImGui::PlotLines("##WaveformMax", plotWaveformInverse, &mview, nview, 0, "", amin, amax, wsize);
+            ImGui::PopStyleColor(2);
+        }
         ImGui::SetCursorScreenPos(savePos);
-        ImGui::PushStyleColor(ImGuiCol_FrameBg, { 0.0f, 0.0f, 0.0f, 0.0f });
-        ImGui::PushStyleColor(ImGuiCol_PlotLines, { 0.0f, 1.0f, 0.0f, 0.5f });
-        ImGui::PlotLines("##WaveformThreshold", plotWaveform, &tview, nview, 0, "", amin, amax, wsize);
-        ImGui::PopStyleColor(2);
-        ImGui::SetCursorScreenPos(savePos);
-        ImGui::PushStyleColor(ImGuiCol_FrameBg, { 0.0f, 0.0f, 0.0f, 0.0f });
-        ImGui::PushStyleColor(ImGuiCol_PlotLines, { 0.0f, 1.0f, 0.0f, 0.5f });
-        ImGui::PlotLines("##WaveformThreshold", plotWaveformInverse, &tview, nview, 0, "", amin, amax, wsize);
-        ImGui::PopStyleColor(2);
-        ImGui::SetCursorScreenPos(savePos);
+
         ImGui::InvisibleButton("##WaveformIB",wsize);
         if (ImGui::IsItemHovered()) {
             auto w = ImGui::GetIO().MouseWheel;
@@ -625,12 +493,12 @@ bool renderKeyPresses(TParameters & params, const char * fnameInput, const TWave
                 offset = dragOffset - ImGui::GetMouseDragDelta(0).x*nview/wsize.x;
             }
 
-            if (ImGui::IsMouseReleased(0) && ImGui::GetIO().KeyCtrl) {
+            if ((ImGui::IsMouseReleased(0) && ImGui::GetIO().KeyCtrl) || ImGui::IsMouseDoubleClicked(0)) {
                 int i = 0;
                 int64_t pos = offset + nview*(mpos.x - savePos.x)/wsize.x;
-                for (i = 0; i < keyPresses.size(); ++i) {
-                    int64_t p0 = keyPresses[i].pos + params.offsetFromPeak - params.keyPressWidth_samples;
-                    int64_t p1 = keyPresses[i].pos + params.offsetFromPeak + params.keyPressWidth_samples;
+                for (i = 0; i < (int) keyPresses.size(); ++i) {
+                    int64_t p0 = keyPresses[i].pos + params.offsetFromPeak_samples - params.keyPressWidth_samples;
+                    int64_t p1 = keyPresses[i].pos + params.offsetFromPeak_samples + params.keyPressWidth_samples;
                     int64_t pmin = std::min(std::min(keyPresses[i].pos, p0), p1);
                     int64_t pmax = std::max(std::max(keyPresses[i].pos, p0), p1);
                     if (pmin > pos) {
@@ -643,7 +511,7 @@ bool renderKeyPresses(TParameters & params, const char * fnameInput, const TWave
                     }
                     if (pos >= pmin && pos <= pmax) break;
                 }
-                if (i == keyPresses.size() && ignoreDelete == false) {
+                if (i == (int) keyPresses.size() && ignoreDelete == false) {
                     ignoreDelete = true;
                     TKeyPressData entry;
                     entry.pos = pos;
@@ -666,7 +534,6 @@ bool renderKeyPresses(TParameters & params, const char * fnameInput, const TWave
 
         auto savePos2 = ImGui::GetCursorScreenPos();
 
-        static bool scrolling = false;
         if (ImGui::IsItemHovered()) {
             if (ImGui::IsMouseDown(0)) {
                 scrolling = true;
@@ -683,8 +550,8 @@ bool renderKeyPresses(TParameters & params, const char * fnameInput, const TWave
 
         offset = std::max(0, std::min((int) offset, (int) waveform.size() - nview));
         for (int i = 0; i < (int) keyPresses.size(); ++i) {
-            if (keyPresses[i].pos + params.offsetFromPeak + params.keyPressWidth_samples < offset) continue;
-            if (keyPresses[i].pos + params.offsetFromPeak - params.keyPressWidth_samples >= offset + nview) break;
+            if (keyPresses[i].pos + params.offsetFromPeak_samples + params.keyPressWidth_samples < offset) continue;
+            if (keyPresses[i].pos + params.offsetFromPeak_samples - params.keyPressWidth_samples >= offset + nview) break;
 
             {
                 float x0 = ((float)(keyPresses[i].pos - offset))/nview;
@@ -697,8 +564,8 @@ bool renderKeyPresses(TParameters & params, const char * fnameInput, const TWave
 
             {
                 float x0 = ((float)(keyPresses[i].pos - offset))/nview;
-                float x1 = ((float)(keyPresses[i].pos + params.offsetFromPeak - params.keyPressWidth_samples - offset))/nview;
-                float x2 = ((float)(keyPresses[i].pos + params.offsetFromPeak + params.keyPressWidth_samples - offset))/nview;
+                float x1 = ((float)(keyPresses[i].pos + params.offsetFromPeak_samples - params.keyPressWidth_samples - offset))/nview;
+                float x2 = ((float)(keyPresses[i].pos + params.offsetFromPeak_samples + params.keyPressWidth_samples - offset))/nview;
 
                 ImVec2 p0 = { savePos.x + x0*wsize.x, savePos.y };
                 ImVec2 p1 = { savePos.x + x1*wsize.x, savePos.y };
@@ -713,7 +580,7 @@ bool renderKeyPresses(TParameters & params, const char * fnameInput, const TWave
                 drawList->AddRectFilled(p1, p2, ImGui::ColorConvertFloat4ToU32({ 1.0f, 0.0f, 0.0f, col }));
 
                 if (isHovered) {
-                    if (ImGui::IsMouseReleased(0) && ImGui::GetIO().KeyCtrl && ignoreDelete == false) {
+                    if (((ImGui::IsMouseReleased(0) && ImGui::GetIO().KeyCtrl) || ImGui::IsMouseDoubleClicked(0)) && ignoreDelete == false) {
                         keyPresses.erase(keyPresses.begin() + i);
                         --i;
                     }
@@ -750,81 +617,509 @@ bool renderKeyPresses(TParameters & params, const char * fnameInput, const TWave
         //auto io = ImGui::GetIO();
         //ImGui::Text("Keys pressed:");   for (int i = 0; i < IM_ARRAYSIZE(io.KeysDown); i++) if (ImGui::IsKeyPressed(i))             { ImGui::SameLine(); ImGui::Text("%d", i); }
 
-        static bool recalculate = true;
         static bool playHalfSpeed = false;
-        static int historySize = 6*1024;
+        static int historySize = 3*1024;
         static float thresholdBackground = 10.0;
         ImGui::PushItemWidth(100.0);
 
-        ImGui::Checkbox("x0.5", &playHalfSpeed);
-        ImGui::SameLine();
-        if (ImGui::Button("Play") || ImGui::IsKeyPressed(44)) { // space
-            g_playbackData.slowDown = playHalfSpeed ? 2 : 1;
-            g_playbackData.idx = 0;
-            g_playbackData.offset = offset;
-            g_playbackData.waveform = getView(waveform, offset, std::min((int) (10*params.sampleRate), nview));
-            SDL_PauseAudioDevice(g_deviceIdOut, 0);
+        if (stateUI.recording == false) {
+            if (stateUI.audioCapture) {
+                if (ImGui::Button("   Record")) {
+                    if (float(stateUI.waveformInput.size()/kSampleRate) < kMaxRecordSize_s) {
+                        audioLogger.resume();
+                        stateUI.recording = true;
+                        g_doRecord = true;
+                    }
+                }
+                {
+                    auto savePos = ImGui::GetCursorScreenPos();
+                    auto p = savePos;
+                    p.x += 0.90f*ImGui::CalcTextSize("  ").x;
+                    p.y -= 0.56f*ImGui::GetFrameHeightWithSpacing();
+                    ImGui::GetWindowDrawList()->AddCircleFilled(p, 6.0, ImGui::ColorConvertFloat4ToU32({ 1.0f, 0.0f, 0.0f, 1.0f }));
+                    ImGui::SetCursorScreenPos(savePos);
+                }
+
+                ImGui::SameLine();
+            }
+
+            ImGui::Checkbox("x0.5", &playHalfSpeed);
+            ImGui::SameLine();
+            if (g_playbackData.playing) {
+                if (ImGui::Button("Stop") || (ImGui::IsKeyPressed(44) && ImGui::GetIO().KeyCtrl)) { // Ctrl + space
+                    g_playbackData.playing = false;
+                    g_playbackData.idx = g_playbackData.waveform.n - TPlaybackData::kSamples;
+                }
+            } else {
+                if (ImGui::Button("Play") || (ImGui::IsKeyPressed(44) && ImGui::GetIO().KeyCtrl)) { // Ctrl + space
+                    g_playbackData.playing = true;
+                    g_playbackData.slowDown = playHalfSpeed ? 2 : 1;
+                    g_playbackData.idx = 0;
+                    g_playbackData.offset = offset;
+                    g_playbackData.waveform = getView(waveform, offset, std::min((int) (10*kSampleRate), nview));
+                    SDL_PauseAudioDevice(g_deviceIdOut, 0);
+                }
+            }
+
+            if (g_playbackData.idx >= g_playbackData.waveform.n - kSamplesPerFrame) {
+                g_playbackData.playing = false;
+                SDL_ClearQueuedAudio(g_deviceIdOut);
+#ifndef __EMSCRIPTEN__
+                SDL_PauseAudioDevice(g_deviceIdOut, 1);
+#endif
+            }
+
+            ImGui::SameLine();
+            ImGui::SliderFloat("Threshold background", &thresholdBackground, 0.1f, 50.0f) && (recalculateKeyPresses = true);
+            ImGui::SameLine();
+            ImGui::SliderInt("History Size", &historySize, 512, 1024*16) && (recalculateKeyPresses = true);
+            ImGui::SameLine();
+            if (ImGui::Button("Recalculate")) {
+                recalculateKeyPresses = true;
+            }
+
+            ImGui::SameLine();
+            ImGui::DragInt("Key width", &params.keyPressWidth_samples, 8, 0, kSampleRate/10);
+            ImGui::SameLine();
+            ImGui::DragInt("Peak offset", &params.offsetFromPeak_samples, 8, -kSampleRate/10, kSampleRate/10);
+            ImGui::SameLine();
+            ImGui::DragInt("Align window", &params.alignWindow_samples, 8, 0, kSampleRate/10);
+
+            ImGui::PopItemWidth();
+        } else {
+            if (g_doRecord) {
+                g_doRecord = false;
+                audioLogger.record(0.2f, 0);
+            }
+
+            if (ImGui::Button("   Stop Recording")) {
+                audioLogger.pause();
+                g_doRecord = false;
+
+                stateUI.recalculateKeyPresses = true;
+                stateUI.lastSize = stateUI.lastSize - 1;
+                stateUI.recording = false;
+                stateUI.rescaleWaveform = true;
+            }
+            {
+                auto savePos = ImGui::GetCursorScreenPos();
+                auto p0 = savePos;
+                p0.x += 0.90f*ImGui::CalcTextSize("  ").x;
+                p0.y -= 0.56f*ImGui::GetFrameHeightWithSpacing();
+
+                auto p1 = p0;
+                p0.x -= 4.0f;
+                p0.y -= 4.0f;
+                p1.x += 4.0f;
+                p1.y += 4.0f;
+
+                ImGui::GetWindowDrawList()->AddRectFilled(p0, p1, ImGui::ColorConvertFloat4ToU32({ 1.0f, 1.0f, 1.0f, 1.0f }));
+                ImGui::SetCursorScreenPos(savePos);
+            }
+
+            ImGui::SameLine();
+            ImGui::Text("Record length: %4.2f s (max : %4.2f s)", (float)(stateUI.waveformInput.size())/kSampleRate, kMaxRecordSize_s);
         }
 
-        if (g_playbackData.idx > g_playbackData.waveform.n) {
-            SDL_PauseAudioDevice(g_deviceIdOut, 1);
+        if (recalculateKeyPresses) {
+            findKeyPresses(getView(waveform, 0), keyPresses, waveformThreshold, waveformMax, thresholdBackground, historySize, true);
+            recalculateKeyPresses = false;
         }
 
-        ImGui::SameLine();
-        ImGui::SliderFloat("Threshold background", &thresholdBackground, 0.1f, 50.0f) && (recalculate = true);
-        ImGui::SameLine();
-        ImGui::SliderInt("History Size", &historySize, 512, 1024*16) && (recalculate = true);
-        ImGui::SameLine();
-        if (ImGui::Button("Recalculate") || recalculate) {
-            findKeyPresses(waveform, keyPresses, waveformThreshold, thresholdBackground, historySize);
-            recalculate = false;
-        }
-
-        static std::string filename = std::string(fnameInput) + ".keys";
-        ImGui::SameLine();
-        ImGui::Text("%s", filename.c_str());
-
-        ImGui::SameLine();
-        if (ImGui::Button("Save")) {
-            saveKeyPresses(filename.c_str(), keyPresses);
-        }
-
-        ImGui::SameLine();
-        if (ImGui::Button("Load")) {
-            loadKeyPresses(filename.c_str(), getView(waveform, 0), keyPresses);
-        }
-
-        ImGui::SameLine();
-        ImGui::DragInt("Key width", &params.keyPressWidth_samples, 8, 0, params.sampleRate/10);
-        ImGui::SameLine();
-        ImGui::DragInt("Peak offset", &params.offsetFromPeak, 8, -params.sampleRate/10, params.sampleRate/10);
-        ImGui::SameLine();
-        ImGui::DragInt("Align window", &params.alignWindow, 8, 0, params.sampleRate/10);
-
-        ImGui::PopItemWidth();
-
-        if (nview != nviewPrev) {
-            generateLowResWaveform(waveform, waveformLowRes, std::max(1.0f, nview/wsize.x));
-            nviewPrev = nview;
-        }
-
+        stateUI.windowHeightKeyPesses = ImGui::GetWindowHeight();
+    } else {
+        stateUI.windowHeightKeyPesses = ImGui::GetTextLineHeightWithSpacing();
     }
     ImGui::End();
 
     return false;
 }
 
-bool renderSimilarity(TParameters & params, TKeyPressCollection & keyPresses, TSimilarityMap & similarityMap) {
-    if (ImGui::Begin("Similarity")) {
-        int n = similarityMap.size();
+bool renderResults(stStateUI & stateUI) {
+    float curHeight = std::min(g_windowSizeY - stateUI.windowHeightTitleBar - stateUI.windowHeightKeyPesses, (12 + stateUI.results.size()*kTopResultsPerProcessor)*ImGui::GetTextLineHeightWithSpacing());
+    ImGui::SetNextWindowPos(ImVec2(0, stateUI.windowHeightTitleBar + stateUI.windowHeightKeyPesses), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(1.0f*g_windowSizeX, curHeight), ImGuiCond_Always);
+    if (ImGui::Begin("Results", nullptr, ImGuiWindowFlags_HorizontalScrollbar | ImGuiWindowFlags_NoMove)) {
+        auto drawList = ImGui::GetWindowDrawList();
+
+        if (ImGui::Button("Calculate Key Similarity")) {
+            stateUI.similarityMap.clear();
+            stateUI.flags.recalculateSimilarityMap = true;
+            stateUI.doUpdate = true;
+        }
+
+        if (stateUI.similarityMap.size() > 0 && stateUI.calculatingSimilarityMap == false) {
+            ImGui::SameLine();
+            if (stateUI.processing) {
+                if (ImGui::Button("Pause") || (ImGui::IsKeyPressed(44) && !ImGui::GetIO().KeyCtrl)) { // space
+                    stateUI.processing = false;
+                    stateUI.flags.changeProcessing = true;
+                    stateUI.doUpdate = true;
+                }
+            } else {
+                if (ImGui::Button("Resume") || (ImGui::IsKeyPressed(44) && !ImGui::GetIO().KeyCtrl)) { // space
+                    stateUI.processing = true;
+                    stateUI.flags.changeProcessing = true;
+                    stateUI.doUpdate = true;
+                }
+            }
+
+            ImGui::SameLine();
+            if (ImGui::Button("Reset")) { // c
+                stateUI.results.clear();
+                if (stateUI.autoHint) {
+                    for (auto & keyPress : stateUI.keyPresses) {
+                        keyPress.bind = -1;
+                    }
+                }
+                stateUI.flags.resetOptimization = true;
+                stateUI.doUpdate = true;
+            }
+
+            //ImGui::SameLine();
+            //if (ImGui::Button("Apply Suggestions")) {
+            //    int n = stateUI.suggestions.size();
+            //    for (int i = 0; i < n; ++i) {
+            //        if (stateUI.suggestions[i] < 0) {
+            //            stateUI.keyPresses[i].bind = -1;
+            //            continue;
+            //        }
+            //        if (stateUI.suggestions[i] > 0 && stateUI.suggestions[i] <= 26) {
+            //            stateUI.keyPresses[i].bind = stateUI.suggestions[i] - 1;
+            //        } else {
+            //            stateUI.keyPresses[i].bind = 26;
+            //        }
+            //    }
+
+            //    stateUI.flags.applyHints = true;
+            //    stateUI.doUpdate = true;
+            //}
+
+            ImGui::SameLine();
+            if (ImGui::Button("Clear Hints")) {
+                for (auto & keyPress : stateUI.keyPresses) {
+                    keyPress.bind = -1;
+                }
+                stateUI.flags.applyHints = true;
+                stateUI.doUpdate = true;
+            }
+        } else {
+            if (stateUI.calculatingSimilarityMap) {
+                ImGui::SameLine();
+                ImGui::TextColored({0.3f, 1.0f, 0.4f, 1.0f}, "Calculating similarity map ...");
+            }
+        }
+
+        ImGui::PushItemWidth(200.0);
+
+        if (ImGui::SliderInt("Clusters", &stateUI.params.valuesClusters[0], 30, 150.0)) {
+            stateUI.flags.applyClusters = true;
+            stateUI.doUpdate = true;
+        }
+
+        ImGui::SameLine();
+        if (ImGui::Checkbox("Auto", &stateUI.autoHint)) {
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::BeginTooltip();
+            ImGui::Text("If checked, hints will be updated automatically based on the suggestions");
+            ImGui::EndTooltip();
+        }
+
+        if (stateUI.results.size() > 0) {
+            int nPerAutoHint = 10;
+            auto id0 = stateUI.results.begin()->second.id%stateUI.params.cipher.nMHIters;
+            auto id1 = (stateUI.results.begin()->second.id/stateUI.params.cipher.nMHIters)%nPerAutoHint;
+            if (stateUI.processing) stateUI.results.begin()->second.id++;
+            ImGui::SameLine();
+            auto progress = float(id1)/nPerAutoHint;
+            ImGui::ProgressBar(progress, { 100.0, ImGui::GetTextLineHeightWithSpacing() });
+            if (stateUI.processing && id0 == 0 && id1 == 0) {
+                for (auto & result : stateUI.results) {
+                    for (auto & item : result.second) {
+                        item.p *= 1.01;
+                    }
+                }
+                if (stateUI.autoHint && stateUI.results.begin()->second.id > 10000) {
+                    int n = stateUI.suggestions.size();
+                    for (int i = 0; i < n; ++i) {
+                        if (frand() > 0.2) {
+                            stateUI.keyPresses[i].bind = -1;
+                            continue;
+                        }
+                        if (stateUI.suggestions[i] < 0) {
+                            stateUI.keyPresses[i].bind = -1;
+                            continue;
+                        }
+
+                        //if (stateUI.suggestions[i] == 0 || stateUI.suggestions[i] == 5) {
+                        //    stateUI.keyPresses[i].bind = rand()%2 == 0 ? 26 : 4;
+                        //    continue;
+                        //}
+
+                        //if (stateUI.suggestions[i] == 0 || stateUI.suggestions[i] == 5) {
+                        //    stateUI.keyPresses[i].bind = -1;
+                        //    continue;
+                        //}
+
+                        if (frand() > 0.0) {
+                            if (stateUI.suggestions[i] > 0 && stateUI.suggestions[i] <= 26) {
+                                stateUI.keyPresses[i].bind = stateUI.suggestions[i] - 1;
+                            } else {
+                                stateUI.keyPresses[i].bind = 26;
+                            }
+                        } else {
+                            char c0 = (stateUI.suggestions[i] > 0 && stateUI.suggestions[i] <= 26) ?
+                                'a' + stateUI.suggestions[i] - 1 : '_';
+
+                            int idx = rand()%kNearbyKeys.at(c0).size();
+                            char c1 = kNearbyKeys.at(c0)[idx];
+
+                            if (c1 == '_') {
+                                stateUI.keyPresses[i].bind = 26;
+                            } else {
+                                stateUI.keyPresses[i].bind = c1 - 'a';
+                            }
+                        }
+                    }
+                    stateUI.flags.applyHints = true;
+                    stateUI.flags.applyWEnglishFreq = true;
+                    stateUI.doUpdate = true;
+                }
+            }
+        }
+
+        //ImGui::SameLine();
+        //if (ImGui::SliderFloat("English weight", &stateUI.params.valuesWEnglishFreq[0], 1.0, 100.0, "%.6f", 2.0)) {
+        //    stateUI.flags.applyWEnglishFreq = true;
+        //    stateUI.doUpdate = true;
+        //}
+
+        ImGui::PopItemWidth();
+
+        ImGui::BeginChild("##currentResults", { 0, 0 }, 1, ImGuiWindowFlags_HorizontalScrollbar | ImGuiWindowFlags_AlwaysHorizontalScrollbar);
+
+        ImGui::Separator();
+        ImGui::Text(" Suggestions");
+        {
+            int n = stateUI.suggestions.size();
+            if (n > 0) {
+                ImGui::SameLine();
+                auto charSize = ImGui::CalcTextSize("a");
+                auto curPos = ImGui::GetCursorScreenPos();
+                ImGui::InvisibleButton("", ImVec2{charSize.x*n, 1.0f});
+                ImGui::SetCursorScreenPos(curPos);
+                for (int i = 0; i < n; ++i) {
+                    char c = ' ';
+                    if (stateUI.suggestions[i] < 0) {
+                        ImGui::Text(" ");
+                    } else {
+                        c = '_';
+                        if (stateUI.suggestions[i] > 0 && stateUI.suggestions[i] <= 26) {
+                            c = 'a'+stateUI.suggestions[i] - 1;
+                        }
+                        ImGui::TextColored({ 1.0f, 1.0f, 0.0f, 1.0f }, "%c", c);
+                    }
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::BeginTooltip();
+                        ImGui::Text("Suggestion for key press %d: '%c'", i, c);
+                        ImGui::EndTooltip();
+                    }
+                    if (i < n - 1) {
+                        curPos.x += charSize.x;
+                        ImGui::SetCursorScreenPos(curPos);
+                    }
+                }
+            }
+        }
+
+        ImGui::Text("       Hints");
+        {
+            int n = stateUI.keyPresses.size();
+            if (n > 0) {
+                ImGui::SameLine();
+                auto charSize = ImGui::CalcTextSize("a");
+                auto curPos = ImGui::GetCursorScreenPos();
+                ImGui::InvisibleButton("", ImVec2{charSize.x*n, 1.0f});
+                ImGui::SetCursorScreenPos(curPos);
+                for (int i = 0; i < n; ++i) {
+                    if (stateUI.keyPresses[i].bind < 0) {
+                        ImGui::Text(".");
+                    } else {
+                        char c = '_';
+                        if (stateUI.keyPresses[i].bind >= 0 && stateUI.keyPresses[i].bind < 26) {
+                            c = 'a'+stateUI.keyPresses[i].bind;
+                        }
+                        ImGui::TextColored({ 0.0f, 1.0f, 0.0f, 1.0f }, "%c", c);
+                    }
+                    if (ImGui::IsItemHovered()) {
+                        auto p0 = curPos;
+                        auto p1 = p0;
+                        p1.x += charSize.x;
+                        p1.y += charSize.y;
+                        drawList->AddRect(p0, p1, ImGui::ColorConvertFloat4ToU32({0.0f, 1.0f, 0.0f, 1.0f}));
+                        drawList->AddRectFilled(p0, p1, ImGui::ColorConvertFloat4ToU32({0.0f, 1.0f, 0.0f, 0.6f}));
+
+                        if (ImGui::IsMouseDown(0)) {
+                            stateUI.nview = 16*1024;
+                            stateUI.offset = stateUI.keyPresses[i].pos - stateUI.nview/2;
+                        }
+
+                        if (ImGui::IsMouseDown(1)) {
+                            stateUI.keyPresses[i].bind = -1;
+                            stateUI.flags.applyHints = true;
+                            stateUI.doUpdate = true;
+                        }
+
+                        for (int k = 0; k < 26; ++k) {
+                            if (ImGui::IsKeyPressed(4 + k)) {
+                                stateUI.keyPresses[i].bind = k;
+                            }
+                        }
+
+                        ImGui::BeginTooltip();
+                        ImGui::Text("Key press: %d", i);
+                        ImGui::Text(" - Left click to focus");
+                        ImGui::Text(" - Right click to remove hint");
+                        ImGui::EndTooltip();
+                    }
+                    if (i < n - 1) {
+                        curPos.x += charSize.x;
+                        ImGui::SetCursorScreenPos(curPos);
+                    }
+                }
+            }
+        }
+
+        ImGui::Text("%2s. %8s", "#", "Prob");
+        ImGui::Separator();
+
+        for (const auto & items : stateUI.results) {
+            ImGui::Separator();
+            const auto & id = items.first;
+            for (const auto & item : items.second) {
+                const auto & result = item;
+
+                ImGui::PushID(id);
+                ImGui::Text("%2d. %8.3f", id, result.p);
+                if (ImGui::IsItemHovered()) {
+                    ImGui::BeginTooltip();
+                    ImGui::Text("Processor   %d", id);
+                    ImGui::Text("Cluster-to-letter map:");
+                    {
+                        int i = 0;
+                        for (auto& pair : result.clMap) {
+                            char c = '_';
+                            if (pair.second > 0 && pair.second <= 26) {
+                                c = 'a' + pair.second - 1;
+                            }
+                            ImGui::Text("%3d: %c  ", pair.first, c);
+                            if (++i % 10 != 0) ImGui::SameLine();
+                        }
+                    }
+                    ImGui::EndTooltip();
+                }
+                if (result.clMap.empty() == false) {
+                    ImGui::SameLine();
+                    int n = std::min(result.clusters.size(), stateUI.keyPresses.size());
+                    auto charSize = ImGui::CalcTextSize("a");
+                    auto curPos = ImGui::GetCursorScreenPos();
+                    if (n > 0) {
+                        ImGui::InvisibleButton("", ImVec2{charSize.x*n, 1.0f});
+                        ImGui::SetCursorScreenPos(curPos);
+                        for (int i = 0; i < n; ++i) {
+                            auto cluster = result.clusters[i];
+                            if (result.clMap.find(cluster) == result.clMap.end()) {
+                                ImGui::Text("%c", '?');
+                            } else {
+                                auto let = result.clMap.at(result.clusters[i]);
+
+                                char c = '.';
+                                if (let > 0 && let <= 26) {
+                                    c = 'a'+let - 1;
+                                }
+
+                                if (stateUI.keyPresses[i].bind == let - 1) {
+                                    ImGui::TextColored({ 0.0f, 1.0f, 0.0f, 1.0f }, "%c", c);
+                                } else if (stateUI.suggestions[i] == let) {
+                                    ImGui::TextColored({ 1.0f, 1.0f, 0.0f, 1.0f }, "%c", c);
+                                } else {
+                                    ImGui::Text("%c", c);
+                                }
+
+                                if (ImGui::IsItemHovered()) {
+                                    auto p0 = curPos;
+                                    auto p1 = p0;
+                                    p1.x += charSize.x;
+                                    p1.y += charSize.y;
+                                    drawList->AddRect(p0, p1, ImGui::ColorConvertFloat4ToU32({0.0f, 1.0f, 0.0f, 1.0f}));
+                                    drawList->AddRectFilled(p0, p1, ImGui::ColorConvertFloat4ToU32({0.0f, 1.0f, 0.0f, 0.6f}));
+                                    if (ImGui::IsMouseDown(0) && ImGui::GetIO().KeyCtrl) {
+                                        for (int j = 0; j < n; ++j) {
+                                            auto let2 = result.clMap.at(result.clusters[j]);
+                                            if (let2 > 0 && let2 <= 26) {
+                                                if (stateUI.keyPresses[j].bind == 26) {
+                                                    stateUI.keyPresses[j].bind = -1;
+                                                }
+                                            } else {
+                                                stateUI.keyPresses[j].bind = 26;
+                                            }
+                                        }
+                                        stateUI.flags.applyHints = true;
+                                        stateUI.doUpdate = true;
+                                    } else if (ImGui::IsMouseDown(0)) {
+                                        if (let > 0 && let <= 26) {
+                                            stateUI.keyPresses[i].bind = let - 1;
+                                        } else {
+                                            stateUI.keyPresses[i].bind = 26;
+                                        }
+                                        stateUI.flags.applyHints = true;
+                                        stateUI.doUpdate = true;
+                                    } else if (ImGui::IsMouseDown(1)) {
+                                        stateUI.keyPresses[i].bind = -1;
+                                    }
+                                    ImGui::BeginTooltip();
+                                    ImGui::Text("Key presss: %d, letter - %d", i, let);
+                                    ImGui::Text(" - Left click to set as hint");
+                                    ImGui::Text(" - Ctrl + left click to set only the spaces as hint");
+                                    ImGui::EndTooltip();
+                                }
+                            }
+
+                            if (i < n - 1) {
+                                curPos.x += charSize.x;
+                                ImGui::SetCursorScreenPos(curPos);
+                            }
+                        }
+                    }
+                }
+                ImGui::PopID();
+            }
+        }
+
+        ImGui::EndChild();
+
+        stateUI.windowHeightResults = ImGui::GetWindowHeight();
+    } else {
+        stateUI.windowHeightResults = ImGui::GetTextLineHeightWithSpacing();
+    }
+
+    ImGui::End();
+    return true;
+}
+
+bool renderSimilarity(const TKeyPressCollection & keyPresses, const TSimilarityMap & similarityMap) {
+    int offsetY = stateUI.windowHeightTitleBar + stateUI.windowHeightKeyPesses + stateUI.windowHeightResults;
+    ImGui::SetNextWindowPos(ImVec2(0, offsetY), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(1.0f*g_windowSizeX, g_windowSizeY - offsetY), ImGuiCond_Always);
+    if (ImGui::Begin("Similarity", nullptr, ImGuiWindowFlags_HorizontalScrollbar | ImGuiWindowFlags_NoMove)) {
         auto wsize = ImGui::GetContentRegionAvail();
 
-        static float bsize = 4.0f;
-        static float threshold = 0.3f;
+        static float bsize = 10.0f;
+        static float threshold = 0.0f;
         ImGui::PushItemWidth(100.0);
-        if (ImGui::Button("Calculate") || ImGui::IsKeyPressed(6)) { // c
-            calculateSimilartyMap(params, keyPresses, similarityMap);
-        }
+
+        int n = similarityMap.size();
         ImGui::SameLine();
         ImGui::SliderFloat("Size", &bsize, 1.5f, 24.0f);
         ImGui::SameLine();
@@ -833,10 +1128,6 @@ bool renderSimilarity(TParameters & params, TKeyPressCollection & keyPresses, TS
         }
         ImGui::SameLine();
         ImGui::SliderFloat("Threshold", &threshold, 0.0f, 1.0f);
-        ImGui::SameLine();
-        if (ImGui::Button("Adjust")) {
-            adjustKeyPresses(params, keyPresses, similarityMap);
-        }
         ImGui::PopItemWidth();
 
         ImGui::BeginChild("Canvas", { 0, 0 }, 1, ImGuiWindowFlags_HorizontalScrollbar | ImGuiWindowFlags_AlwaysHorizontalScrollbar | ImGuiWindowFlags_AlwaysVerticalScrollbar);
@@ -844,111 +1135,56 @@ bool renderSimilarity(TParameters & params, TKeyPressCollection & keyPresses, TS
         auto drawList = ImGui::GetWindowDrawList();
 
         int hoveredId = -1;
-        ImGui::InvisibleButton("SimilarityMapIB", { n*bsize, n*bsize });
-        for (int i = 0; i < n; ++i) {
-            for (int j = 0; j < n; ++j) {
-                float col = similarityMap[i][j].cc;
-                ImVec2 p0 = {savePos.x + j*bsize, savePos.y + i*bsize};
-                ImVec2 p1 = {savePos.x + (j + 1)*bsize - 1.0f, savePos.y + (i + 1)*bsize - 1.0f};
-                if (similarityMap[i][j].cc > threshold) {
-                    drawList->AddRectFilled(p0, p1, ImGui::ColorConvertFloat4ToU32({1.0f, 1.0f, 1.0f, col}));
-                }
-                if (ImGui::IsMouseHoveringRect(p0, {p1.x + 1.0f, p1.y + 1.0f})) {
-                    if (i == j) hoveredId = i;
-                    if (ImGui::IsMouseDown(0) == false) {
-                        ImGui::BeginTooltip();
-                        ImGui::Text("[%3d, %3d]\n", keyPresses[i].cid, keyPresses[j].cid);
-                        ImGui::Text("[%3d, %3d] = %5.4g\n", i, j, similarityMap[i][j].cc);
-                        for (int k = 0; k < n; ++k) {
-                            if (similarityMap[i][k].cc > 0.5) ImGui::Text("Offset [%3d, %3d] = %d\n", i, k, (int) similarityMap[i][k].offset);
+        if (n > 0) {
+            ImGui::InvisibleButton("SimilarityMapIB", { n*bsize, n*bsize });
+            for (int i = 0; i < n; ++i) {
+                for (int j = 0; j < n; ++j) {
+                    float col = similarityMap[i][j].cc;
+                    ImVec2 p0 = {savePos.x + j*bsize, savePos.y + i*bsize};
+                    ImVec2 p1 = {savePos.x + (j + 1)*bsize - 1.0f, savePos.y + (i + 1)*bsize - 1.0f};
+                    if (similarityMap[i][j].cc > threshold) {
+                        drawList->AddRectFilled(p0, p1, ImGui::ColorConvertFloat4ToU32(ImVec4{1.0f - col, col, 0.0f, col}));
+                    }
+                    if (ImGui::IsMouseHoveringRect(p0, {p1.x + 1.0f, p1.y + 1.0f})) {
+                        if (i == j) hoveredId = i;
+                        if (ImGui::IsMouseDown(0) == false) {
+                            ImGui::BeginTooltip();
+                            //ImGui::Text("[%3d, %3d]\n", keyPresses[i].cid, keyPresses[j].cid);
+                            ImGui::Text("[%3d, %3d] = %5.4g\n", i, j, similarityMap[i][j].cc);
+                            //for (int k = 0; k < n; ++k) {
+                            //    if (similarityMap[i][k].cc > 0.5) ImGui::Text("Offset [%3d, %3d] = %d\n", i, k, (int) similarityMap[i][k].offset);
+                            //}
+                            //ImGui::Separator();
+                            //for (int k = 0; k < n; ++k) {
+                            //    if (similarityMap[k][i].cc > 0.5) ImGui::Text("Offset [%3d, %3d] = %d\n", k, i, (int) similarityMap[k][i].offset);
+                            //}
+                            ImGui::EndTooltip();
                         }
-                        ImGui::Separator();
-                        for (int k = 0; k < n; ++k) {
-                            if (similarityMap[k][i].cc > 0.5) ImGui::Text("Offset [%3d, %3d] = %d\n", k, i, (int) similarityMap[k][i].offset);
-                        }
-                        ImGui::EndTooltip();
                     }
                 }
             }
-        }
 
-        if (hoveredId >= 0) {
-            for (int i = 0; i < n; ++i) {
-                if (keyPresses[i].cid == keyPresses[hoveredId].cid) {
-                    ImVec2 p0 = {savePos.x + i*bsize, savePos.y + i*bsize};
-                    ImVec2 p1 = {savePos.x + (i + 1)*bsize - 1.0f, savePos.y + (i + 1)*bsize - 1.0f};
-                    drawList->AddRectFilled(p0, p1, ImGui::ColorConvertFloat4ToU32({1.0f, 0.0f, 0.0f, 1.0f}));
+            if (hoveredId >= 0) {
+                for (int i = 0; i < n; ++i) {
+                    if (keyPresses[i].cid == keyPresses[hoveredId].cid) {
+                        ImVec2 p0 = {savePos.x + i*bsize, savePos.y + i*bsize};
+                        ImVec2 p1 = {savePos.x + (i + 1)*bsize - 1.0f, savePos.y + (i + 1)*bsize - 1.0f};
+                        drawList->AddRectFilled(p0, p1, ImGui::ColorConvertFloat4ToU32({1.0f, 0.0f, 0.0f, 1.0f}));
+                    }
                 }
             }
+        } else {
+            ImGui::TextColored({1.0f, 0.3f, 0.4f, 1.0f}, "Waiting for similarity map to be available!");
         }
 
         ImGui::EndChild();
+
+        stateUI.windowHeightSimilarity = ImGui::GetWindowHeight();
+    } else {
+        stateUI.windowHeightSimilarity = ImGui::GetTextLineHeightWithSpacing();
     }
     ImGui::End();
     return false;
-}
-
-bool renderClusters(TParameters & params, TKeyPressCollection & keyPresses, TSimilarityMap & similarityMap) {
-    if (ImGui::Begin("Clusters")) {
-        ImGui::Text("Clusters: %d\n", keyPresses.nClusters);
-        ImGui::SliderFloat("Threshold", &params.thresholdClustering, 0.0f, 1.0f);
-        if (ImGui::Button("Calculate")) {
-            clusterG(similarityMap, keyPresses, params.thresholdClustering);
-        }
-    }
-    ImGui::End();
-    return false;
-}
-
-bool renderSolution(TParameters & params, TFreqMap freqMap, TKeyPressCollection & keyPresses, TSimilarityMap & similarityMap) {
-    static int nIters = 10000;
-    static std::string enc = "";
-
-    if (ImGui::Begin("Solution")) {
-        ImGui::SliderInt("Iterations", &nIters, 0, 1e6);
-        if (ImGui::Button("Calculate")) {
-            int n = keyPresses.size();
-            enc.resize(n);
-            for (int i = 0; i < n; ++i) {
-                enc[i] = keyPresses[i].cid;
-            }
-            printText(enc);
-            std::string decrypted;
-            kN = std::max(27, keyPresses.nClusters);
-            decrypt(freqMap, enc, decrypted, nIters);
-        }
-    }
-    ImGui::End();
-
-    return false;
-}
-
-void cbPlayback(void * userData, uint8_t * stream, int len) {
-    PlaybackData * data = (PlaybackData *)(userData);
-    auto end = std::min(data->idx + PlaybackData::kSamples/data->slowDown, data->waveform.n);
-    auto idx = data->idx;
-    auto sidx = 0;
-    for (; idx < end; ++idx) {
-        int16_t a = data->waveform.samples[idx];
-        memcpy(stream + (sidx)*sizeof(a), &a, sizeof(a));
-        len -= sizeof(a);
-        ++sidx;
-
-        if (data->slowDown == 2) {
-            int16_t a2 = data->waveform.samples[idx + 1];
-            a = 0.5*(a + a2);
-            memcpy(stream + (sidx)*sizeof(a), &a, sizeof(a));
-            len -= sizeof(a);
-            ++sidx;
-        }
-    }
-    while (len > 0) {
-        int16_t a = 0;
-        memcpy(stream + (idx - data->idx)*sizeof(a), &a, sizeof(a));
-        len -= sizeof(a);
-        ++idx;
-    }
-    data->idx = idx;
 }
 
 bool prepareAudioOut(const TParameters & params) {
@@ -963,27 +1199,32 @@ bool prepareAudioOut(const TParameters & params) {
         printf("    - Playback device #%d: '%s'\n", i, SDL_GetAudioDeviceName(i, SDL_FALSE));
     }
 
+    if (params.playbackId < 0 || params.playbackId >= nDevices) {
+        printf("Invalid playback device id selected - %d\n", params.playbackId);
+        return false;
+    }
+
     SDL_AudioSpec playbackSpec;
     SDL_zero(playbackSpec);
 
-    playbackSpec.freq = params.sampleRate;
-    playbackSpec.format = AUDIO_S16;
+    playbackSpec.freq = kSampleRate;
+    playbackSpec.format = std::is_same<TSample, int16_t>::value ? AUDIO_S16 : AUDIO_S32;
     playbackSpec.channels = 1;
-    playbackSpec.samples = PlaybackData::kSamples;
-    playbackSpec.callback = cbPlayback;
+    playbackSpec.samples = TPlaybackData::kSamples;
+    playbackSpec.callback = cbPlayback<TSample>;
     playbackSpec.userdata = &g_playbackData;
 
     SDL_AudioSpec obtainedSpec;
     SDL_zero(obtainedSpec);
 
-    g_deviceIdOut = SDL_OpenAudioDevice(NULL, SDL_FALSE, &playbackSpec, &obtainedSpec, 0);
+    g_deviceIdOut = SDL_OpenAudioDevice(SDL_GetAudioDeviceName(params.playbackId, SDL_FALSE), SDL_FALSE, &playbackSpec, &obtainedSpec, 0);
     if (!g_deviceIdOut) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Couldn't open an audio device for playback: %s!\n", SDL_GetError());
         SDL_Quit();
         return false;
     }
 
-    printf("Opened playback device %d\n", g_deviceIdOut);
+    printf("Opened playback device succesfully!\n");
     printf("    Frequency:  %d\n", obtainedSpec.freq);
     printf("    Format:     %d\n", obtainedSpec.format);
     printf("    Channels:   %d\n", obtainedSpec.channels);
@@ -997,93 +1238,212 @@ bool prepareAudioOut(const TParameters & params) {
 int main(int argc, char ** argv) {
     srand(time(0));
 
-    printf("Usage: %s recrod.kbd n-gram.txt\n", argv[0]);
+    printf("Build: %s, (%s)\n", kGIT_DATE, kGIT_SHA1);
+    printf("Usage: %s record.kbd n-gram-dir [-pN] [-cN] [-CN]\n", argv[0]);
+    printf("    -pN - select playback device N\n");
+    printf("    -cN - select capture device N\n");
+    printf("    -CN - select number N of capture channels to use\n");
     if (argc < 3) {
         return -1;
     }
 
-    TParameters params;
-    TWaveform waveformInput;
-    TKeyPressCollection keyPresses;
-    TSimilarityMap similarityMap;
+    auto argm = parseCmdArguments(argc, argv);
+    int playbackId = argm["p"].empty() ? 0 : std::stoi(argm["p"]);
+    int captureId = argm["c"].empty() ? 0 : std::stoi(argm["c"]);
+    int nChannels = argm["C"].empty() ? 0 : std::stoi(argm["C"]);
+
+    stateUI.params.playbackId = playbackId;
+    stateUI.fnameRecord = argv[1];
+    stateUI.fnameKeyPressess = stateUI.fnameRecord + ".keys";
+
+    stateUI.waveformInput.reserve(kSamplesPerFrame*kMaxRecordSize_frames);
+    stateUI.waveformOriginal.reserve(kSamplesPerFrame*kMaxRecordSize_frames);
 
     if (SDL_Init(SDL_INIT_VIDEO|SDL_INIT_TIMER) != 0) {
         printf("Error: %s\n", SDL_GetError());
-        return -1;
-    }
-
-    if (prepareAudioOut(params) == false) {
-        printf("Error: failed to initialize audio playback\n");
         return -2;
     }
 
+    AudioLogger::Callback cbAudio = [&](const AudioLogger::Record & frames) {
+        stateCapture.recordNew.insert(
+                stateCapture.recordNew.end(),
+                frames.begin(),
+                frames.end());
+
+        stateCapture.flags.updateRecord = true;
+        stateCapture.update();
+
+        g_doRecord = true;
+
+        return;
+    };
+
+    g_doInit = [&]() {
+        if (prepareAudioOut(stateUI.params) == false) {
+            printf("Error: failed to initialize audio playback\n");
+            return false;
+        }
+
+        AudioLogger::Parameters parameters;
+        parameters.callback = cbAudio;
+        parameters.captureId = captureId;
+        parameters.nChannels = nChannels;
+        parameters.sampleRate = kSampleRate;
+        parameters.freqCutoff_Hz = kFreqCutoff_Hz;
+
+        if (audioLogger.install(std::move(parameters)) == false) {
+            fprintf(stderr, "Failed to initialize audio capture\n");
+        } else {
+            audioLogger.pause();
+            stateUI.audioCapture = true;
+
+            printf("[+] Audio capture initilized succesfully\n");
+        }
+
+        return true;
+    };
+
+    g_doReload = [&]() {
+        stateUI.loadRecord = true;
+
+        return true;
+    };
+
+    g_getOutputRecordId = [&]() {
+        return stateUI.outputRecordId;
+    };
+
     printf("[+] Loading recording from '%s'\n", argv[1]);
-    if (readFromFile(argv[1], waveformInput) == false) {
+    if (readFromFile<TSampleF>(argv[1], stateUI.waveformOriginal) == false) {
         printf("Specified file '%s' does not exist\n", argv[1]);
-        return -1;
+        //return -4;
+    } else {
+        printf("[+] Converting waveform to i16 format ...\n");
+        if (convert(stateUI.waveformOriginal, stateUI.waveformInput) == false) {
+            printf("Conversion failed\n");
+            return -4;
+        }
+
+        stateUI.recalculateKeyPresses = true;
+        stateUI.maxSample = calcAbsMax(stateUI.waveformOriginal);
     }
 
-    TFreqMap freqMap;
-    if (loadFreqMap(argv[2], freqMap) == false) {
-        return -1;
+    Cipher::TFreqMap freqMap3;
+    Cipher::TFreqMap freqMap4;
+    Cipher::TFreqMap freqMap5;
+
+    if (Cipher::loadFreqMap((std::string(argv[2]) + "/./english_trigrams.txt").c_str(), freqMap3) == false) {
+        return -5;
+    }
+    if (Cipher::loadFreqMap((std::string(argv[2]) + "/./english_quadgrams.txt").c_str(), freqMap4) == false) {
+        return -5;
+    }
+    if (Cipher::loadFreqMap((std::string(argv[2]) + "/./english_quintgrams.txt").c_str(), freqMap5) == false) {
+        return -5;
+    }
+    stateCore.freqMap[0] = &freqMap3;
+    stateCore.freqMap[1] = &freqMap4;
+    stateCore.freqMap[2] = &freqMap5;
+
+    Gui::Objects guiObjects;
+    if (Gui::init("Keytap2", g_windowSizeX, g_windowSizeY, guiObjects) == false) {
+        return -6;
     }
 
-    int windowSizeX = 1920;
-    int windowSizeY = 1200;
+    g_setWindowSize = [&](int sizeX, int sizeY) {
+        SDL_SetWindowSize(guiObjects.window, sizeX, sizeY);
+    };
 
-#if __APPLE__
-    // GL 3.2 Core + GLSL 150
-    const char* glsl_version = "#version 150";
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 2);
-#else
-    // GL 3.0 + GLSL 130
-    const char* glsl_version = "#version 130";
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, 0);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
-#endif
-
-    // Create window with graphics context
-    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
-    SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
-    SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
-    SDL_DisplayMode current;
-    SDL_GetCurrentDisplayMode(0, &current);
-    SDL_Window* window = SDL_CreateWindow("Keytap", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, windowSizeX, windowSizeY, SDL_WINDOW_OPENGL|SDL_WINDOW_RESIZABLE|SDL_WINDOW_ALLOW_HIGHDPI);
-    SDL_GLContext gl_context = SDL_GL_CreateContext(window);
-    SDL_GL_SetSwapInterval(1); // Enable vsync
-
-    // Initialize OpenGL loader
-    bool err = gl3wInit() != 0;
-    if (err) {
-        fprintf(stderr, "Failed to initialize OpenGL loader!\n");
-        return 1;
-    }
-
-    // Setup Dear ImGui binding
-    IMGUI_CHECKVERSION();
-    ImGui::CreateContext();
-    ImGuiIO& io = ImGui::GetIO(); (void)io;
-    //io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;  // Enable Keyboard Controls
-
-    ImGui::GetStyle().AntiAliasedFill = false;
-    ImGui::GetStyle().AntiAliasedLines = false;
-
-    ImGui_ImplSDL2_InitForOpenGL(window, gl_context);
-    ImGui_ImplOpenGL3_Init(glsl_version);
-
-    printf("[+] Loaded recording: of %d samples (sample size = %d bytes)\n", (int) waveformInput.size(), (int) sizeof(TSample));
-    printf("    Size in memory:          %g MB\n", (float)(sizeof(TSample)*waveformInput.size())/1024/1024);
+    printf("[+] Loaded recording: of %d samples (sample size = %d bytes)\n", (int) stateUI.waveformInput.size(), (int) sizeof(TSample));
+    printf("    Size in memory:          %g MB\n", (float)(sizeof(TSample)*stateUI.waveformInput.size())/1024/1024);
     printf("    Sample size:             %d\n", (int) sizeof(TSample));
-    printf("    Total number of samples: %d\n", (int) waveformInput.size());
-    printf("    Recording length:        %g seconds\n", (float)(waveformInput.size())/params.sampleRate);
+    printf("    Total number of samples: %d\n", (int) stateUI.waveformInput.size());
+    printf("    Recording length:        %g seconds\n", (float)(stateUI.waveformInput.size())/kSampleRate);
 
     bool finishApp = false;
-    while (finishApp == false) {
+    g_mainUpdate = [&]() {
+        if (finishApp) return false;
+
+        if (stateCore.changed()) {
+            auto stateCoreNew = stateCore.get();
+
+            stateUI.calculatingSimilarityMap = stateCoreNew.flags.calculatingSimilarityMap;
+
+            if (stateCoreNew.flags.updateSimilarityMap) {
+                stateUI.similarityMap = stateCoreNew.similarityMap;
+            }
+
+            bool recalcSuggestions = false;
+            for (int i = 0; i < stateCoreNew.params.nProcessors(); ++i) {
+                if (stateCoreNew.flags.updateResult[i]) {
+                    recalcSuggestions = true;
+                    if (stateCoreNew.processors[i].getResult().id != stateUI.results[i].id) {
+                        stateUI.results[i].id = stateCoreNew.processors[i].getResult().id;
+                        if (stateUI.results[i].size() < kTopResultsPerProcessor) {
+                            stateUI.results[i].push_back(stateCoreNew.processors[i].getResult());
+                        } else if (stateCoreNew.processors[i].getResult().p > stateUI.results[i].back().p) {
+                            stateUI.results[i].back() = stateCoreNew.processors[i].getResult();
+
+                            int k = kTopResultsPerProcessor - 1;
+                            while (k > 0) {
+                                if (stateUI.results[i][k-1].p < stateUI.results[i][k].p) {
+                                    std::swap(stateUI.results[i][k-1], stateUI.results[i][k]);
+                                } else {
+                                    break;
+                                }
+                                --k;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (recalcSuggestions) {
+                int n = stateUI.keyPresses.size();
+                stateUI.suggestions.resize(n);
+
+                for (int i = 0; i < n; ++i) {
+                    int c = 0;
+                    std::map<int, int> cnt;
+                    for (const auto & result : stateUI.results) {
+                        const auto & item = result.second.front();
+                        if (item.clMap.find(item.clusters[i]) == item.clMap.end()) continue;
+                        if (i <= (int) item.clusters.size()) {
+                            ++cnt[item.clMap.at(item.clusters[i])];
+                            ++c;
+                        }
+                    }
+                    bool hasSuggestion = false;
+                    for (auto & s : cnt) {
+                        if (s.second > 0.5*c) {
+                            stateUI.suggestions[i] = s.first;
+                            hasSuggestion = true;
+                        }
+                    }
+                    if (hasSuggestion == false) {
+                        stateUI.suggestions[i] = -1;
+                    }
+                }
+            }
+        }
+
+        if (stateCapture.changed()) {
+            auto stateCaptureNew = stateCapture.get();
+
+            if (stateCaptureNew.flags.updateRecord) {
+                for (auto & frame : stateCaptureNew.recordNew) {
+                    stateUI.waveformOriginal.insert(stateUI.waveformOriginal.end(), frame.begin(), frame.end());
+                }
+
+                int nold = stateUI.waveformInput.size();
+                float scale = float(std::numeric_limits<TSample>::max())/(stateUI.maxSample == 0.0 ? 1.0f : stateUI.maxSample);
+                stateUI.waveformInput.resize(stateUI.waveformOriginal.size());
+                for (int i = nold; i < (int) stateUI.waveformInput.size(); ++i) {
+                    stateUI.waveformInput[i] = scale*stateUI.waveformOriginal[i];
+                }
+            }
+        }
+
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
             ImGui_ImplSDL2_ProcessEvent(&event);
@@ -1096,44 +1456,382 @@ int main(int argc, char ** argv) {
                         finishApp = true;
                     }
                     break;
+                case SDL_DROPFILE:
+                    {
+                        char * path = event.drop.file;
+                        stateUI.fnameRecord = path;
+                        stateUI.loadRecord = true;
+                        SDL_free(path);
+                    }
+                    break;
                 case SDL_WINDOWEVENT:
-                    if (event.window.event == SDL_WINDOWEVENT_CLOSE && event.window.windowID == SDL_GetWindowID(window)) finishApp = true;
+                    if (event.window.event == SDL_WINDOWEVENT_CLOSE && event.window.windowID == SDL_GetWindowID(guiObjects.window)) {
+                        finishApp = true;
+                    }
                     break;
             };
         }
 
-        SDL_GetWindowSize(window, &windowSizeX, &windowSizeY);
-
-        auto tStart = std::chrono::high_resolution_clock::now();
+        SDL_GetWindowSize(guiObjects.window, &g_windowSizeX, &g_windowSizeY);
 
         ImGui_ImplOpenGL3_NewFrame();
-        ImGui_ImplSDL2_NewFrame(window);
+        ImGui_ImplSDL2_NewFrame(guiObjects.window);
         ImGui::NewFrame();
 
-        renderKeyPresses(params, argv[1], waveformInput, keyPresses);
-        renderSimilarity(params, keyPresses, similarityMap);
-        renderClusters(params, keyPresses, similarityMap);
-        renderSolution(params, freqMap, keyPresses, similarityMap);
+        stateUI.windowHeightTitleBar = ImGui::GetTextLineHeightWithSpacing();
 
-        ImGui::Text("Application average %.3f ms/frame (%.1f FPS)", 1000.0f / ImGui::GetIO().Framerate, ImGui::GetIO().Framerate);
+        if (ImGui::BeginMainMenuBar())
+        {
+            if (ImGui::BeginMenu("File"))
+            {
+                ImGui::Separator();
+                ImGui::TextDisabled("Record: %s", stateUI.fnameRecord.c_str());
+                ImGui::Separator();
+                if (ImGui::MenuItem("Save Record")) {
+                    saveToFile(stateUI.fnameRecord, stateUI.waveformOriginal);
+                    stateUI.outputRecordId++;
+                }
+                if (ImGui::MenuItem("Load Record")) {
+                    stateUI.loadRecord = true;
+                }
 
-        ImGui::Render();
-        SDL_GL_MakeCurrent(window, gl_context);
-        glViewport(0, 0, (int) io.DisplaySize.x, (int) io.DisplaySize.y);
-        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-        glClear(GL_COLOR_BUFFER_BIT);
-        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-        SDL_GL_SwapWindow(window);
+                ImGui::Separator();
+                ImGui::TextDisabled("Key Presses: %s", stateUI.fnameKeyPressess.c_str());
+                ImGui::Separator();
+                if (ImGui::MenuItem("Save Key Presses")) {
+                    saveKeyPresses(stateUI.fnameKeyPressess.c_str(), stateUI.keyPresses);
+                }
+                if (ImGui::MenuItem("Load Key Presses")) {
+                    stateUI.loadKeyPresses = true;
+                }
 
-        // stupid hack to limit frame-rate to ~60 fps on Mojave
-        auto tEnd = std::chrono::high_resolution_clock::now();
-        auto tus = std::chrono::duration_cast<std::chrono::microseconds>(tEnd - tStart).count();
-        while (tus < 1e6/60.0) {
-            std::this_thread::sleep_for(std::chrono::microseconds(std::max(100, (int) (0.5*(1e6/60.0 - tus)))));
-            tEnd = std::chrono::high_resolution_clock::now();
-            tus = std::chrono::duration_cast<std::chrono::microseconds>(tEnd - tStart).count();
+                ImGui::EndMenu();
+            }
+            if (ImGui::BeginMenu("Help")) {
+                if (ImGui::MenuItem("Parameters")) {
+                    stateUI.openParametersWindow = true;
+                }
+                if (ImGui::MenuItem("About")) {
+                    stateUI.openAboutWindow = true;
+                }
+                ImGui::EndMenu();
+            }
+            ImGui::EndMainMenuBar();
         }
+
+        if (stateUI.openAboutWindow) {
+            ImGui::OpenPopup("About");
+            stateUI.openAboutWindow = false;
+        }
+        ImGui::SetNextWindowSize({512, -1}, ImGuiCond_Once);
+        if (ImGui::BeginPopupModal("About", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoScrollbar)) {
+            ImGui::Text("%s", "");
+            {
+                const char * text = "Keytap2 : v0.1 [%s]    ";
+                ImGui::Text("%s", "");
+                ImGui::SameLine(0.5f*ImGui::GetContentRegionAvailWidth() - 0.45f*ImGui::CalcTextSize(text).x);
+                ImGui::Text(text, kGIT_SHA1);
+            }
+            ImGui::Text("%s", "");
+            {
+                const char * text = "author : Georgi Gerganov";
+                ImGui::Text("%s", "");
+                ImGui::SameLine(0.5f*ImGui::GetContentRegionAvailWidth() - 0.45f*ImGui::CalcTextSize(text).x);
+                ImGui::Text("%s", text);
+            }
+            {
+                const char * text = "source code : https://github.com/ggerganov/kbd-audio";
+                ImGui::Text("%s", "");
+                ImGui::SameLine(0.5f*ImGui::GetContentRegionAvailWidth() - 0.45f*ImGui::CalcTextSize(text).x);
+                ImGui::Text("%s", text);
+            }
+            ImGui::Text("%s", "");
+            {
+                const char * text = "Close";
+                ImGui::Text("%s", "");
+                ImGui::SameLine(0.5f*ImGui::GetContentRegionAvailWidth() - 0.45f*ImGui::CalcTextSize(text).x);
+                if (ImGui::Button(text)) {
+                    ImGui::CloseCurrentPopup();
+                }
+            }
+            ImGui::Text("%s", "");
+            ImGui::EndPopup();
+        }
+
+        if (stateUI.openParametersWindow) {
+            ImGui::OpenPopup("Parameters");
+            stateUI.openParametersWindow = false;
+        }
+        ImGui::SetNextWindowSize({320, -1}, ImGuiCond_Once);
+        if (ImGui::BeginPopupModal("Parameters", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoScrollbar)) {
+            ImGui::Text("%s", "");
+            ImGui::Text("Sample rate            : %d\n", (int) kSampleRate);
+            ImGui::Text("Samples per frame      : %d\n", (int) kSamplesPerFrame);
+            ImGui::Text("Hardware concurrency   : %d\n", (int) std::thread::hardware_concurrency());
+            ImGui::Text("Max record size        : %g s\n", kMaxRecordSize_s);
+            ImGui::Text("Freq cutoff            : %g Hz\n", kFreqCutoff_Hz);
+            ImGui::Text("Subbreak Processors    : %d\n", stateUI.params.nProcessors());
+            ImGui::Text("%s", "");
+
+            {
+                const char * text = "Close";
+                ImGui::Text("%s", "");
+                ImGui::SameLine(0.5f*ImGui::GetContentRegionAvailWidth() - 0.45f*ImGui::CalcTextSize(text).x);
+                if (ImGui::Button(text)) {
+                    ImGui::CloseCurrentPopup();
+                }
+            }
+            ImGui::Text("%s", "");
+            ImGui::EndPopup();
+        }
+
+
+        if (stateUI.loadRecord) {
+            printf("[+] Loading recording from '%s'\n", argv[1]);
+            if (readFromFile<TSampleF>(stateUI.fnameRecord, stateUI.waveformOriginal) == false) {
+                printf("Specified file '%s' does not exist\n", argv[1]);
+            } else {
+                printf("[+] Converting waveform to i16 format ...\n");
+                if (convert(stateUI.waveformOriginal, stateUI.waveformInput) == false) {
+                    printf("Conversion failed\n");
+                } else {
+                    stateUI.nview = -1;
+                    stateUI.recalculateKeyPresses = true;
+                    stateUI.maxSample = calcAbsMax(stateUI.waveformOriginal);
+                    stateUI.flags.recalculateSimilarityMap = true;
+                    stateUI.doUpdate = true;
+                }
+            }
+
+            stateUI.loadRecord = false;
+        }
+
+        if (stateUI.loadKeyPresses) {
+            loadKeyPresses(stateUI.fnameKeyPressess.c_str(), getView(stateUI.waveformInput, 0), stateUI.keyPresses);
+            stateUI.loadKeyPresses = false;
+        }
+
+        if (stateUI.rescaleWaveform) {
+            if (convert(stateUI.waveformOriginal, stateUI.waveformInput) == false) {
+                fprintf(stderr, "error : recording failed\n");
+            }
+            stateUI.maxSample = calcAbsMax(stateUI.waveformOriginal);
+
+            stateUI.rescaleWaveform = false;
+        }
+
+        if (float(stateUI.waveformInput.size())/kSampleRate >= kMaxRecordSize_s) {
+            stateUI.waveformInput.resize((kMaxRecordSize_frames - 1)*kSamplesPerFrame);
+            audioLogger.pause();
+            g_doRecord = false;
+
+            stateUI.recalculateKeyPresses = true;
+            stateUI.lastSize = stateUI.lastSize - 1;
+            stateUI.recording = false;
+            stateUI.rescaleWaveform = true;
+        }
+
+        for (int i = 0; i < IM_ARRAYSIZE(ImGui::GetIO().KeysDown); i++) if (ImGui::IsKeyPressed(i)) {
+            //printf("Key pressed: %d\n", i);
+        }
+
+        renderKeyPresses(stateUI, stateUI.waveformInput, stateUI.keyPresses);
+        renderResults(stateUI);
+        renderSimilarity(stateUI.keyPresses, stateUI.similarityMap);
+
+        Gui::render(guiObjects);
+
+        if (stateUI.doUpdate) {
+            stateUI.update();
+            stateUI.doUpdate = false;
+        }
+
+        return true;
+    };
+
+    std::thread workerCore([&]() {
+        while (finishApp == false) {
+            if (stateUI.changed()) {
+                auto stateUINew = stateUI.get();
+
+                if (stateUINew.flags.recalculateSimilarityMap || stateUINew.flags.resetOptimization) {
+                    if (stateUINew.keyPresses.size() < 3) continue;
+
+                    stateCore.params = stateUINew.params;
+                    stateCore.keyPresses = stateUINew.keyPresses;
+
+                    printf("[+] Recalculating similarity map ...\n");
+
+                    if (stateUINew.flags.recalculateSimilarityMap) {
+                        stateCore.flags.calculatingSimilarityMap = true;
+                        stateCore.update(true);
+
+                        calculateSimilartyMap(
+                                stateUINew.params.keyPressWidth_samples,
+                                stateUINew.params.alignWindow_samples,
+                                stateUINew.params.offsetFromPeak_samples,
+                                stateCore.keyPresses,
+                                stateCore.similarityMap);
+
+                        if (adjustKeyPresses(stateCore.keyPresses, stateCore.similarityMap)) {
+                            calculateSimilartyMap(
+                                    stateUINew.params.keyPressWidth_samples,
+                                    stateUINew.params.alignWindow_samples,
+                                    stateUINew.params.offsetFromPeak_samples,
+                                    stateCore.keyPresses,
+                                    stateCore.similarityMap);
+                        }
+
+                        printf("[+] Similarity map recalculated\n");
+
+                        stateCore.flags.calculatingSimilarityMap = false;
+                        stateCore.flags.updateSimilarityMap = true;
+                        stateCore.update();
+                    }
+
+                    int n = stateCore.params.nProcessors();
+                    for (int i = 0; i < n; ++i) {
+                        int nClusters = stateCore.params.valueForProcessorClusters(i);
+                        double p = stateCore.params.valueForProcessorPNonAlphabetic(i);
+                        double w = stateCore.params.valueForProcessorWEnglishFreq(i);
+
+                        Cipher::TParameters params;
+                        params.maxClusters = nClusters;
+                        stateCore.processors[i] = Cipher::Processor();
+                        stateCore.processors[i].init(
+                                params,
+                                *stateCore.freqMap[i%3],
+                                stateCore.similarityMap);
+
+                        stateCore.processors[i].setPNonAlphabetic(std::log(p));
+                        stateCore.processors[i].setWEnglishFreq(w);
+
+                        printf("[+] Processor %d initialized: cluster = %d, p = %g, w = %g\n", i, nClusters, p, w);
+                    }
+                }
+
+                if (stateUINew.flags.changeProcessing) {
+                    stateCore.processing = stateUINew.processing;
+                }
+
+                if (stateUINew.flags.applyClusters) {
+                    stateCore.params = stateUINew.params;
+
+                    int n = stateCore.params.nProcessors();
+                    for (int i = 0; i < n; ++i) {
+                        int nClusters = stateCore.params.valueForProcessorClusters(i);
+                        double p = stateCore.params.valueForProcessorPNonAlphabetic(i);
+                        double w = stateCore.params.valueForProcessorWEnglishFreq(i);
+
+                        Cipher::TParameters params;
+                        params.maxClusters = nClusters;
+                        stateCore.processors[i].init(
+                                params,
+                                *stateCore.freqMap[i%3],
+                                stateCore.similarityMap);
+
+                        stateCore.processors[i].setPNonAlphabetic(std::log(p));
+                        stateCore.processors[i].setWEnglishFreq(w);
+                    }
+                }
+
+                if (stateUINew.flags.applyWEnglishFreq) {
+                    stateCore.params = stateUINew.params;
+
+                    int n = stateCore.params.nProcessors();
+                    for (int i = 0; i < n; ++i) {
+                        double w = stateCore.params.valueForProcessorWEnglishFreq(i);
+                        stateCore.processors[i].setWEnglishFreq(w);
+                    }
+                }
+
+                if (stateUINew.flags.applyHints) {
+                    stateCore.keyPresses = stateUINew.keyPresses;
+                }
+            }
+
+            if (stateCore.processing && stateCore.keyPresses.size() >= 3) {
+                static auto tStart = t_ms();
+
+                {
+                    int n = stateCore.keyPresses.size();
+                    stateCore.params.cipher.hint.clear();
+                    stateCore.params.cipher.hint.resize(n, -1);
+                    for (int i = 0; i < n; ++i) {
+                        if (stateCore.keyPresses[i].bind < 0) continue;
+                        stateCore.params.cipher.hint[i] = stateCore.keyPresses[i].bind + 1;
+                    }
+                }
+
+#ifdef __EMSCRIPTEN__
+                static int iter = 0;
+                {
+                    int p = iter%stateCore.params.nProcessors();
+                    stateCore.processors[p].setHint(stateCore.params.cipher.hint);
+                    stateCore.processors[p].compute();
+
+                    stateCore.flags.updateResult[p] = true;
+                    stateCore.update();
+
+                    ++iter;
+                }
+#else
+                int nFinished = 0;
+                int nWorkers = std::min(stateCore.params.nProcessors(), (int) std::thread::hardware_concurrency()/2);
+
+                std::mutex mutex;
+                std::condition_variable cv;
+                std::vector<std::thread> workers(nWorkers);
+                for (int iw = 0; iw < (int) workers.size(); ++iw) {
+                    auto & worker = workers[iw];
+                    worker = std::thread([&](int ith) {
+                        int n = stateCore.params.nProcessors();
+                        for (int i = ith; i < n; i += nWorkers) {
+                            stateCore.processors[i].setHint(stateCore.params.cipher.hint);
+                            stateCore.processors[i].compute();
+
+                            stateCore.flags.updateResult[i] = true;
+                            stateCore.update();
+                        }
+                        {
+                            std::lock_guard<std::mutex> lock(mutex);
+                            ++nFinished;
+                            cv.notify_one();
+                        }
+                    }, iw);
+                    worker.detach();
+                }
+
+                std::unique_lock<std::mutex> lock(mutex);
+                cv.wait(lock, [&]() { return nFinished == nWorkers; });
+#endif
+
+                auto tEnd = t_ms();
+                //printf("Performance: %g iters/sec\n", 1000.0*stateCore.processors[0].getIters()/(tEnd - tStart));
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        }
+    });
+
+#ifdef __EMSCRIPTEN__
+    emscripten_set_main_loop_arg(mainUpdate, NULL, 0, true);
+#else
+    if (g_doInit() == false) {
+        printf("Error: failed to initialize audio playback\n");
+        return -2;
     }
+
+    while (true) {
+        if (g_mainUpdate() == false) break;
+    }
+
+    workerCore.join();
+
+    printf("[+] Terminated\n");
+
+    Gui::free(guiObjects);
+#endif
 
     return 0;
 }

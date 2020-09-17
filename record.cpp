@@ -4,6 +4,7 @@
  */
 
 #include "constants.h"
+#include "common.h"
 #include "audio_logger.h"
 
 #include <stdio.h>
@@ -14,32 +15,40 @@
 #include <cstdio>
 #include <chrono>
 #include <thread>
+#include <deque>
 #include <fstream>
 
-int main(int argc, const char ** argv) {
+int main(int argc, char ** argv) {
+    printf("Usage: %s output.kbd [-cN]\n", argv[0]);
+    printf("    -cN - select capture device N\n");
+    printf("    -CN - number N of capture channels N\n");
+    printf("\n");
+
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s output.kbd\n", argv[0]);
         return -127;
     }
+
+    auto argm = parseCmdArguments(argc, argv);
+    int captureId = argm["c"].empty() ? 0 : std::stoi(argm["c"]);
+    int nChannels = argm["C"].empty() ? 0 : std::stoi(argm["C"]);
 
     auto tStart = std::chrono::high_resolution_clock::now();
     auto tEnd = std::chrono::high_resolution_clock::now();
 
     size_t totalSize_bytes = 0;
-    constexpr float kBufferSize_s = 0.075f;
-    constexpr int64_t kSampleRate = 24000;
-
-    int keyPressed = -1;
-    int bufferSize_frames = 2*AudioLogger::getBufferSize_frames(kSampleRate, kBufferSize_s) - 1;
+    std::deque<int> keyPressedQueue;
     std::map<int, int> nTimes;
-    printf("Recording %d frames per key press\n", bufferSize_frames);
+    printf("Recording %d frames per key press\n", kBufferSizeTrain_frames);
 
     std::ofstream fout(argv[1], std::ios::binary);
-    fout.write((char *)(&bufferSize_frames), sizeof(bufferSize_frames));
+    fout.write((char *)(&kBufferSizeTrain_frames), sizeof(kBufferSizeTrain_frames));
 
     AudioLogger audioLogger;
     AudioLogger::Callback cbAudio = [&](const auto & frames) {
         tEnd = std::chrono::high_resolution_clock::now();
+
+        int keyPressed = keyPressedQueue.front();
+        keyPressedQueue.pop_front();
 
         fout.write((char *)(&keyPressed), sizeof(keyPressed));
         for (const auto & frame : frames) {
@@ -55,7 +64,14 @@ int main(int argc, const char ** argv) {
         keyPressed = -1;
     };
 
-    if (audioLogger.install(kSampleRate, cbAudio) == false) {
+    AudioLogger::Parameters parameters;
+    parameters.callback = std::move(cbAudio);
+    parameters.captureId = captureId;
+    parameters.nChannels = nChannels;
+    parameters.sampleRate = kSampleRate;
+    parameters.freqCutoff_Hz = kFreqCutoff_Hz;
+
+    if (audioLogger.install(std::move(parameters)) == false) {
         fprintf(stderr, "Failed to install audio logger\n");
         return -1;
     }
@@ -69,9 +85,9 @@ int main(int argc, const char ** argv) {
         while (true) {
             int key = getchar();
             tStart = std::chrono::high_resolution_clock::now();
-            if (keyPressed == -1) {
-                keyPressed = key;
-                audioLogger.record(kBufferSize_s);
+            keyPressedQueue.push_back(key);
+            if (audioLogger.record(kBufferSizeTrain_s, 2) == false) {
+                fprintf(stderr, "error : failed to record\n");
             }
         }
         tcsetattr ( STDIN_FILENO, TCSANOW, &oldt );

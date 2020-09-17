@@ -11,7 +11,7 @@
 #include <chrono>
 #include <thread>
 
-int main(int argc, const char ** argv) {
+int main(int , const char ** ) {
     constexpr float kBufferSize_s = 0.150f;
     constexpr uint64_t kSampleRate = 96000;
     constexpr uint64_t kRingBufferSize = 16*1024;
@@ -27,12 +27,15 @@ int main(int argc, const char ** argv) {
 
     bool doRecord = true;
 
+    int nFrames = getBufferSize_frames(kSampleRate, kBufferSize_s);
+    int nFrames2 = std::max(1, nFrames/2);
+
     AudioLogger audioLogger;
     AudioLogger::Callback cbAudio = [&](const auto & frames) {
         doRecord = true;
         float amax = 0.0f;
-        for (int f = 0; f < frames.size(); ++f) {
-            for (int s = 0; s < frames[f].size(); s += bkgrStep_samples) {
+        for (int f = 0; f < (int) frames.size(); ++f) {
+            for (int s = 0; s < (int) frames[f].size(); s += bkgrStep_samples) {
                 rbAverage *= rbSamples.size();
                 rbAverage -= rbSamples[rbBegin];
                 auto acur = std::abs(frames[f][s]);
@@ -40,7 +43,7 @@ int main(int argc, const char ** argv) {
                 if (acur > amax) amax = acur;
                 rbAverage += acur;
                 rbAverage /= rbSamples.size();
-                if (++rbBegin >= rbSamples.size()) rbBegin = 0;
+                if (++rbBegin >= (int) rbSamples.size()) rbBegin = 0;
             }
         }
 
@@ -48,8 +51,8 @@ int main(int argc, const char ** argv) {
         int nFrames = frames.size();
         int nFrames2 = std::max(1, nFrames/2);
         for (int f = nFrames2 - nFrames2/2; f <= nFrames2 + nFrames2/2; ++f) {
-            for (int s = 0; s < frames[f].size(); ++s) {
-                if (s + skip_samples >= frames[f].size()) {
+            for (int s = 0; s < (int) frames[f].size(); ++s) {
+                if (s + skip_samples >= (int) frames[f].size()) {
                     skip_samples -= frames[f].size() - s;
                     s += skip_samples;
                     continue;
@@ -68,7 +71,14 @@ int main(int argc, const char ** argv) {
         printf("Average = %10.8f, max = %10.8f\n", rbAverage, amax);
     };
 
-    if (audioLogger.install(kSampleRate, cbAudio) == false) {
+    AudioLogger::Parameters parameters;
+    parameters.callback = std::move(cbAudio);
+    parameters.captureId = 0;
+    parameters.nChannels = 1;
+    parameters.sampleRate = kSampleRate;
+    parameters.freqCutoff_Hz = kFreqCutoff_Hz;
+
+    if (audioLogger.install(std::move(parameters)) == false) {
         fprintf(stderr, "Failed to install audio logger\n");
         return -1;
     }
@@ -76,7 +86,7 @@ int main(int argc, const char ** argv) {
     while (true) {
         if (doRecord) {
             doRecord = false;
-            audioLogger.record(kBufferSize_s);
+            audioLogger.record(kBufferSize_s, nFrames2/2);
         } else {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }

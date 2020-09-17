@@ -3,6 +3,8 @@
  *  \author Georgi Gerganov
  */
 
+#include "constants.h"
+#include "common.h"
 #include "audio_logger.h"
 
 #include "fftw3.h"
@@ -21,20 +23,23 @@
 #include <cstdlib>
 #include <chrono>
 
-int main(int, char**) {
-    auto t0 = std::chrono::high_resolution_clock::now();
-
+int main(int argc, char ** argv) {
     if (SDL_Init(SDL_INIT_VIDEO|SDL_INIT_AUDIO|SDL_INIT_TIMER) != 0) {
         printf("Error: %s\n", SDL_GetError());
         return -1;
     }
 
+    auto argm = parseCmdArguments(argc, argv);
+    int captureId = argm["c"].empty() ? 0 : std::stoi(argm["c"]);
+    int nChannels = argm["C"].empty() ? 0 : std::stoi(argm["C"]);
+
+    printf("Usage: %s output.kbd [-cN]\n", argv[0]);
+    printf("    -cN - select capture device N\n");
+    printf("    -CN - number N of capture channels N\n");
+    printf("\n");
+
     int windowSizeX = 1280;
     int windowSizeY = 800;
-
-    constexpr float kBufferSize_s = 0.1f;
-    constexpr int64_t kSampleRate = 12000;
-    constexpr int64_t kBufferSize_frames = 2*AudioLogger::getBufferSize_frames(kSampleRate, kBufferSize_s) - 1;
 
 #if __APPLE__
     // GL 3.2 Core + GLSL 150
@@ -86,18 +91,18 @@ int main(int, char**) {
     std::mutex mutex;
 
     printf("sizeof fftwf_complex = %d\n", (int) sizeof(fftwf_complex));
-    fftwf_complex * fftIn = (fftwf_complex*) fftwf_malloc(sizeof(fftwf_complex)*AudioLogger::kSamplesPerFrame);
-    fftwf_complex * fftOut = (fftwf_complex*) fftwf_malloc(sizeof(fftwf_complex)*AudioLogger::kSamplesPerFrame);
-    fftwf_plan fftPlan = fftwf_plan_dft_1d(AudioLogger::kSamplesPerFrame, fftIn, fftOut, FFTW_FORWARD, FFTW_ESTIMATE);
+    fftwf_complex * fftIn = (fftwf_complex*) fftwf_malloc(sizeof(fftwf_complex)*kSamplesPerFrame);
+    fftwf_complex * fftOut = (fftwf_complex*) fftwf_malloc(sizeof(fftwf_complex)*kSamplesPerFrame);
+    fftwf_plan fftPlan = fftwf_plan_dft_1d(kSamplesPerFrame, fftIn, fftOut, FFTW_FORWARD, FFTW_ESTIMATE);
 
     using TKey = int;
-    using TKeyWaveform = std::array<AudioLogger::Frame, kBufferSize_frames>;
+    using TKeyWaveform = std::array<AudioLogger::Frame, kBufferSizeTrain_frames>;
 
     TKey keyPressed = -1;
     std::map<TKey, TKeyWaveform> keySoundAverageAmpl;
     std::map<TKey, TKeyWaveform> keySoundAverageFreq;
 
-    std::vector<float> similarityForOffset(4*AudioLogger::kSamplesPerFrame);
+    std::vector<float> similarityForOffset(4*kSamplesPerFrame);
 
     AudioLogger audioLogger;
     AudioLogger::Callback cbAudio = [&](const AudioLogger::Record & framesOriginal) {
@@ -114,7 +119,7 @@ int main(int, char**) {
             int imax = 0;
             float amax = 0.0f;
 
-            int n = AudioLogger::kSamplesPerFrame;
+            int n = kSamplesPerFrame;
             for (int k = 0; k < nFrames; ++k) {
                 auto & curFrame = frames[k];
                 for (int i = 0; i < n; ++i) {
@@ -248,26 +253,33 @@ int main(int, char**) {
         auto & buffersAmpl = keySoundAverageAmpl[keyPressed];
         auto & buffersFreq = keySoundAverageFreq[keyPressed];
         for (int k = 0; k < nFrames; ++k) {
-            for (auto i = 0; i < AudioLogger::kSamplesPerFrame; ++i) {
+            for (auto i = 0; i < kSamplesPerFrame; ++i) {
                 buffersAmpl[fid][i] = frames[k][i];
                 fftIn[i][0] = buffersAmpl[fid][i];
                 fftIn[i][1] = 0;
             }
             fftwf_execute(fftPlan);
-            for (auto i = 0; i < AudioLogger::kSamplesPerFrame; ++i) {
+            for (auto i = 0; i < kSamplesPerFrame; ++i) {
                 buffersFreq[fid][i] = fftOut[i][0]*fftOut[i][0] + fftOut[i][1]*fftOut[i][1];
             }
-            for (auto i = 1; i < AudioLogger::kSamplesPerFrame/2; ++i) {
-                buffersFreq[fid][i] += buffersFreq[fid][AudioLogger::kSamplesPerFrame - i];
+            for (auto i = 1; i < kSamplesPerFrame/2; ++i) {
+                buffersFreq[fid][i] += buffersFreq[fid][kSamplesPerFrame - i];
             }
 
-            if (++fid >= buffersAmpl.size()) break;
+            if (++fid >= (int) buffersAmpl.size()) break;
         }
 
         keyPressed = -1;
     };
 
-    if (audioLogger.install(kSampleRate, cbAudio) == false) {
+    AudioLogger::Parameters parameters;
+    parameters.callback = std::move(cbAudio);
+    parameters.captureId = captureId;
+    parameters.nChannels = nChannels;
+    parameters.sampleRate = kSampleRate;
+    parameters.freqCutoff_Hz = kFreqCutoff_Hz;
+
+    if (audioLogger.install(std::move(parameters)) == false) {
         fprintf(stderr, "Failed to install audio logger\n");
         return -1;
     }
@@ -285,7 +297,7 @@ int main(int, char**) {
                         //auto t1 = std::chrono::high_resolution_clock::now();
                         //printf("Event: %d\n", (int) std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
                         keyPressed = event.key.keysym.sym;
-                        audioLogger.record(kBufferSize_s);
+                        audioLogger.record(kBufferSizeTrain_s, 3);
                     }
                     break;
                 case SDL_QUIT:
@@ -304,7 +316,7 @@ int main(int, char**) {
         ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Once);
         ImGui::SetNextWindowSize(ImVec2(windowSizeX, windowSizeY), ImGuiCond_Once);
         ImGui::Begin("Average Key Waveform");
-        ImGui::Text("Frames in buffer: %d\n", (int) kBufferSize_frames);
+        ImGui::Text("Frames in buffer: %d\n", (int) kBufferSizeTrain_frames);
         {
             std::lock_guard<std::mutex> lock(mutex);
 
@@ -316,8 +328,8 @@ int main(int, char**) {
             for (const auto & ampl : keySoundAverageAmpl) {
                 struct SampleGetter {
                     static float f(void * data, int i) {
-                        int fid = i/AudioLogger::kSamplesPerFrame;
-                        int sid = i - fid*AudioLogger::kSamplesPerFrame;
+                        int fid = i/kSamplesPerFrame;
+                        int sid = i - fid*kSamplesPerFrame;
                         const auto & frames = *(TKeyWaveform *)(data);
                         const auto & frame = frames[fid];
                         return frame[sid];
@@ -330,7 +342,7 @@ int main(int, char**) {
                 skey[0] = ampl.first;
                 ImGui::PlotLines(
                     ("##" + skey).c_str(),
-                    getter, (void *)(intptr_t)(&ampl.second), ampl.second.size()*AudioLogger::kSamplesPerFrame,
+                    getter, (void *)(intptr_t)(&ampl.second), ampl.second.size()*kSamplesPerFrame,
                     0, skey.c_str(), FLT_MAX, FLT_MAX, ImVec2(windowSizeX, 0.1f*windowSizeY));
 
                 int nFrames = keySoundAverageFreq[ampl.first].size();

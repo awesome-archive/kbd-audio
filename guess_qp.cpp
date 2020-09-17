@@ -8,6 +8,7 @@
 #include "emscripten/emscripten.h"
 #endif
 
+#include "constants.h"
 #include "audio_logger.h"
 
 #include <stdio.h>
@@ -64,7 +65,7 @@ int main(int, char**) {
     constexpr uint64_t kSampleRate = 48000;
 #endif
 
-    constexpr uint64_t kBufferSize_frames = 2*AudioLogger::getBufferSize_frames(kSampleRate, kBufferSize_s) - 1;
+    constexpr uint64_t kBufferSize_frames = getBufferSize_frames(kSampleRate, kBufferSize_s);
 
     using ValueCC = float;
     using Offset = int;
@@ -76,8 +77,6 @@ int main(int, char**) {
     TKey keyPressed = -1;
     std::map<TKey, TKeyHistory> keySoundHistoryAmpl;
     std::map<TKey, TKeyWaveform> keySoundAverageAmpl;
-
-    float bufferSize_s = 1.000f;
 
     int timesToPressQ = 5;
     int timesToPressP = 5;
@@ -148,7 +147,7 @@ int main(int, char**) {
             }
 
             int nFramesPerWaveform = ampl.size();
-            int nSamplesPerFrame = AudioLogger::kSamplesPerFrame;
+            int nSamplesPerFrame = kSamplesPerFrame;
             int centerSample = nFramesPerWaveform*nSamplesPerFrame/2;
             int alignWindow = centerSample/2;
 
@@ -185,7 +184,14 @@ int main(int, char**) {
     };
 
     g_init = [&]() {
-        if (audioLogger.install(kSampleRate, cbAudio) == false) {
+        AudioLogger::Parameters parameters;
+        parameters.callback = std::move(cbAudio);
+        parameters.captureId = 0;
+        parameters.nChannels = 1;
+        parameters.sampleRate = kSampleRate;
+        parameters.freqCutoff_Hz = kFreqCutoff_Hz;
+
+        if (audioLogger.install(std::move(parameters)) == false) {
             fprintf(stderr, "Failed to install audio logger\n");
             return -1;
         }
@@ -199,7 +205,7 @@ int main(int, char**) {
         if (keyPressed == -1) {
             g_predictedKey = -1;
             keyPressed = key;
-            audioLogger.record(kBufferSize_s);
+            audioLogger.record(kBufferSize_s, 3);
         }
     };
 
@@ -241,7 +247,7 @@ int main(int, char**) {
 
                 int nWaveforms = history.size();
                 int nFramesPerWaveform = history[0].size();
-                int nSamplesPerFrame = AudioLogger::kSamplesPerFrame;
+                int nSamplesPerFrame = kSamplesPerFrame;
 
                 printf("    - Training key '%c'\n", key);
                 printf("    - History size = %d key waveforms\n", nWaveforms);
